@@ -13,7 +13,7 @@ Environment=PATH=/home/machine/.npm-global/bin:/home/machine/.local/bin:/usr/loc
 EnvironmentFile=-/home/machine/.config/numeric-lua/agents.env
 Environment=GIT_TERMINAL_PROMPT=0
 WorkingDirectory=/home/machine/Códigos/numeric-lua/numeric-lua-agents
-ExecStart=/usr/bin/python3 /home/machine/Códigos/numeric-lua/numeric-lua-agents/promo-agents --config /home/machine/.config/numeric-lua/agents.toml --once
+ExecStart=/usr/bin/python3 /home/machine/Códigos/numeric-lua/numeric-lua-agents/promo-agents --config /home/machine/.config/numeric-lua/agents.toml --state-dir /home/machine/.local/state/numeric-lua/service-state --once
 Nice=10
 IOSchedulingClass=idle
 UMask=0077
