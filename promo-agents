@@ -1,0 +1,1467 @@
+#!/usr/bin/env python3
+"""Run one headless agent at a time for the numeric-lua repositories.
+
+The scheduler is adapted from the Maria Padilha scheduler, with two additions:
+a task may name several repositories in simple front matter, and the scheduler
+holds a host-wide ``flock`` for the whole tick. Everything else is deliberately
+boring: it creates a throwaway git worktree per repository, starts
+``dsh --profile headless``, records the PID, and stops it before the discount
+window closes. It never pushes ``main`` and never merges anything.
+
+Typical use::
+
+    promo-agents --config ~/.config/numeric-lua/agents.toml --once
+    promo-agents --config ... --dry-run
+    promo-agents --config ... --status
+    promo-agents --config ... --print-config
+    promo-agents --config ... --stop
+    promo-agents --config ... --enqueue luatorch --title "..."
+
+Run ``--once`` from a timer, or ``--daemon`` to chain tasks as soon as an agent
+exits. Agents are detached, so they continue after the timer process exits; the
+next tick monitors and stops them.
+
+A cross-repository task looks like this::
+
+    ---
+    title: Add numlua broadcasting tests
+    repos: luatorch, numlua
+    ---
+    Task body...
+
+Without front matter, the task targets the repository whose queue contains it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import tomllib
+from datetime import datetime, time as clock_time, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+BASE_BRANCH = "main"
+TEST_TIMEOUT_SECONDS = 300
+
+
+class TaskError(Exception):
+    """A queued task is malformed and must not be started."""
+
+
+def expand(path: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(str(path))))
+
+
+def state_home() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state"))
+
+
+def state_dir_default() -> Path:
+    return state_home() / "numeric-lua" / "agents"
+
+
+def lock_default() -> Path:
+    return state_home() / "numeric-lua" / "agents.lock"
+
+
+def config_root() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "numeric-lua"
+
+
+def config_default() -> Path:
+    return config_root() / "agents.toml"
+
+
+def parse_clock(value: str) -> clock_time:
+    hour, minute = value.split(":", 1)
+    return clock_time(int(hour), int(minute))
+
+
+def promo_day_key(now: datetime) -> str:
+    """Group evening and early-morning windows into one daily cycle."""
+    return (now - timedelta(hours=10)).date().isoformat()
+
+
+def load_config(path: Path) -> dict:
+    with path.open("rb") as handle:
+        config = tomllib.load(handle)
+
+    schedule = config.setdefault("schedule", {})
+    schedule.setdefault("timezone", "UTC")
+    schedule.setdefault("stop_margin_minutes", 30)
+    schedule.setdefault("stop_grace_seconds", 20)
+    schedule.setdefault("max_tasks_per_day", 0)  # 0 = no daily cap
+    schedule.setdefault("windows", [])
+
+    agent = config.setdefault("agent", {})
+    agent.setdefault("command", ["dsh", "--profile", "headless"])
+
+    maintenance = config.setdefault("maintenance", {})
+    maintenance.setdefault("enabled", False)
+    maintenance.setdefault("max_rounds_per_window", 0)  # 0 = until the margin
+    maintenance.setdefault("min_round_seconds", 900)
+
+    lock = config.setdefault("lock", {})
+    lock.setdefault("path", str(lock_default()))
+    lock["path"] = expand(lock["path"])
+
+    repos = config.setdefault("repos", {})
+    for name, repo in repos.items():
+        if not isinstance(repo, dict):
+            raise SystemExit(f"{path}: repos.{name} must be a table")
+        if "path" not in repo:
+            raise SystemExit(f"{path}: repos.{name}.path is required")
+        repo["path"] = expand(repo["path"])
+        repo.setdefault("queue", config_default().parent / "agents" / "queue" / name)
+        repo["queue"] = expand(repo["queue"])
+        repo.setdefault("tests", [])
+        repo.setdefault("push", False)
+        repo.setdefault("open_pr", False)
+
+    validate_config(config, path)
+    return config
+
+
+def validate_config(config: dict, path: Path) -> None:
+    """Fail closed on a schedule or repository the scheduler cannot trust."""
+    schedule = config["schedule"]
+    try:
+        ZoneInfo(schedule["timezone"])
+    except Exception:
+        raise SystemExit(
+            f"{path}: schedule.timezone {schedule['timezone']!r} is not a known zone"
+        )
+
+    for key, minimum in (
+        ("stop_margin_minutes", 0),
+        ("stop_grace_seconds", 0),
+        ("max_tasks_per_day", 0),
+    ):
+        value = schedule[key]
+        if not isinstance(value, int) or value < minimum:
+            raise SystemExit(f"{path}: schedule.{key} must be an integer >= {minimum}")
+
+    windows = schedule["windows"]
+    if not isinstance(windows, list) or not windows:
+        raise SystemExit(f"{path}: schedule.windows is empty")
+
+    for index, window in enumerate(windows, 1):
+        if not isinstance(window, dict):
+            raise SystemExit(f"{path}: schedule.windows[{index}] must be a table")
+        for key in ("start", "end"):
+            if key not in window:
+                raise SystemExit(f"{path}: schedule.windows[{index}] has no {key}")
+            try:
+                parse_clock(window[key])
+            except (ValueError, TypeError):
+                raise SystemExit(
+                    f"{path}: schedule.windows[{index}].{key} is not HH:MM: "
+                    f"{window[key]!r}"
+                )
+        for day in window.get("days", DAY_NAMES):
+            if str(day).lower()[:3] not in DAY_NAMES:
+                raise SystemExit(
+                    f"{path}: schedule.windows[{index}].days has an unknown day {day!r}"
+                )
+
+    command = config["agent"]["command"]
+    if (not isinstance(command, list) or not command
+            or not all(isinstance(part, str) and part for part in command)):
+        raise SystemExit(f"{path}: agent.command must be a non-empty list of strings")
+
+    maintenance = config["maintenance"]
+    if not isinstance(maintenance.get("enabled"), bool):
+        raise SystemExit(f"{path}: maintenance.enabled must be true or false")
+    for key, minimum in (("max_rounds_per_window", 0), ("min_round_seconds", 0)):
+        value = maintenance[key]
+        if not isinstance(value, int) or value < minimum:
+            raise SystemExit(f"{path}: maintenance.{key} must be an integer >= {minimum}")
+
+    lock_path = config["lock"]["path"]
+    if not isinstance(lock_path, Path) or str(lock_path) == "":
+        raise SystemExit(f"{path}: lock.path must be a non-empty string")
+
+    for name, repo in config["repos"].items():
+        tests = repo["tests"]
+        if (not isinstance(tests, list)
+                or not all(isinstance(part, str) and part for part in tests)):
+            raise SystemExit(f"{path}: repos.{name}.tests must be a list of strings")
+        for key in ("push", "open_pr"):
+            if not isinstance(repo[key], bool):
+                raise SystemExit(f"{path}: repos.{name}.{key} must be true or false")
+
+
+def window_at(config: dict, now: datetime) -> tuple[datetime, datetime] | None:
+    """Return the active window, including one that crossed midnight."""
+    tz = ZoneInfo(config["schedule"]["timezone"])
+    local = now.astimezone(tz)
+
+    for offset in (-1, 0):
+        day = local.date() + timedelta(days=offset)
+        for window in config["schedule"]["windows"]:
+            days = [d.lower()[:3] for d in window.get("days", DAY_NAMES)]
+            if day.strftime("%a").lower()[:3] not in days:
+                continue
+            start_clock = parse_clock(window["start"])
+            end_clock = parse_clock(window["end"])
+            start = datetime.combine(day, start_clock, tzinfo=tz)
+            end = datetime.combine(day, end_clock, tzinfo=tz)
+            if end <= start:
+                end += timedelta(days=1)
+            if start <= local < end:
+                return start, end
+    return None
+
+
+def load_state(path: Path) -> dict:
+    try:
+        state = json.loads(path.read_text())
+    except Exception:
+        return {"running": {}, "finished": []}
+    if not isinstance(state, dict):
+        return {"running": {}, "finished": []}
+    state.setdefault("running", {})
+    state.setdefault("finished", [])
+    return state
+
+
+def save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    tmp.replace(path)
+
+
+def log(path: Path, message: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    with path.open("a") as handle:
+        handle.write(f"{stamp} {message}\n")
+
+
+def boot_id() -> str:
+    """Identify the boot, so a reused PID is never signalled."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat.rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def stop_group(pid: int, sig: int = signal.SIGTERM) -> None:
+    # pid 0 would signal this scheduler's own process group.
+    if pid <= 0:
+        return
+    try:
+        os.killpg(pid, sig)
+    except OSError:
+        pass
+
+
+def wait_for_exit(pids: list[int], seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        if not any(alive(pid) for pid in pids):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Tasks and front matter
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1].strip()
+    return value
+
+
+def parse_repo_list(value: str) -> list[str]:
+    value = _unquote(value)
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    names = []
+    for part in value.split(","):
+        name = _unquote(part)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def parse_front_matter(text: str) -> tuple[dict, str]:
+    """Split optional leading ``---`` front matter from a Markdown task.
+
+    The format is intentionally tiny: one ``key: value`` per line, with
+    ``title`` and ``repos`` understood. Unknown keys are ignored.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+
+    closing = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            closing = index
+            break
+    if closing is None:
+        raise TaskError("front matter starts with --- but has no closing ---")
+
+    meta: dict[str, str] = {}
+    for number, line in enumerate(lines[1:closing], 2):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in stripped:
+            raise TaskError(f"front matter line {number} is not key: value")
+        key, value = stripped.split(":", 1)
+        key = key.strip().lower()
+        if not key:
+            raise TaskError(f"front matter line {number} has an empty key")
+        meta[key] = value.strip()
+
+    return meta, "\n".join(lines[closing + 1:])
+
+
+def first_heading(text: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            heading = stripped.lstrip("#").strip()
+            if heading:
+                return heading
+    return None
+
+
+def first_line(text: str) -> str | None:
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return None
+
+
+def load_task(path: Path, queue_repo: str, config: dict) -> dict:
+    text = path.read_text(errors="replace")
+    meta, body = parse_front_matter(text)
+    repo_names = parse_repo_list(meta.get("repos", ""))
+
+    if not repo_names:
+        # No front matter, or front matter without repos: preserve the original
+        # single-repository queue behavior.
+        repo_names = [queue_repo]
+
+    unknown = [name for name in repo_names if name not in config["repos"]]
+    if unknown:
+        raise TaskError(
+            f"{path.name} names unknown repositories: {', '.join(unknown)}"
+        )
+
+    title = _unquote(meta.get("title", "")) or first_heading(body) or first_line(body) or path.stem
+    return {
+        "path": path,
+        "queue_repo": queue_repo,
+        "title": title,
+        "repos": repo_names,
+        "body": body.strip(),
+        "meta": meta,
+    }
+
+
+def find_next_task(config: dict, queue_repo: str) -> tuple[dict | None, list[tuple[Path, str]]]:
+    """Return the oldest usable task and any malformed task errors."""
+    queue = Path(config["repos"][queue_repo]["queue"])
+    if not queue.is_dir():
+        return None, []
+    errors: list[tuple[Path, str]] = []
+    for path in sorted(p for p in queue.glob("*.md") if p.is_file()):
+        try:
+            return load_task(path, queue_repo, config), errors
+        except TaskError as exc:
+            errors.append((path, str(exc)))
+    return None, errors
+
+
+def slugify(text: str) -> str:
+    text = re.sub(r"[^a-zA-Z0-9]+", "-", text.lower()).strip("-")
+    return text[:40] or "task"
+
+
+def enqueue(config: dict, repos_arg: str, title_arg: str | None, body: str,
+            dry: bool) -> int:
+    """Write one coordinator task into a repository queue.
+
+    ``--enqueue`` accepts a comma-separated list of repositories. The task is
+    written to the first repository's queue, and a multi-repo task gets front
+    matter naming all of them.
+    """
+    destinations = parse_repo_list(repos_arg)
+    if not destinations:
+        print("promo-agents: --enqueue needs a repository", file=sys.stderr)
+        return 2
+    unknown = [name for name in destinations if name not in config["repos"]]
+    if unknown:
+        print(
+            f"promo-agents: unknown repository {', '.join(unknown)!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    body = body.strip()
+    if not body:
+        print("promo-agents: --enqueue needs a body on stdin or --body",
+              file=sys.stderr)
+        return 2
+
+    had_front_matter = body.startswith("---")
+    meta: dict[str, str] = {}
+    task_body = body
+    if had_front_matter:
+        try:
+            meta, task_body = parse_front_matter(body)
+        except TaskError as exc:
+            print(f"promo-agents: {exc}", file=sys.stderr)
+            return 2
+
+    meta_repos = parse_repo_list(meta.get("repos", ""))
+    unknown = [name for name in meta_repos if name not in config["repos"]]
+    if unknown:
+        print(
+            f"promo-agents: task names unknown repository {', '.join(unknown)!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    task_repos = meta_repos or destinations
+    title = (title_arg or _unquote(meta.get("title", ""))
+             or first_heading(task_body) or first_line(task_body) or "").strip()
+    if not title:
+        print("promo-agents: the task has no title", file=sys.stderr)
+        return 2
+
+    if not first_heading(task_body):
+        task_body = f"# {title}\n\n{task_body}" if task_body else f"# {title}"
+    task_body = task_body.rstrip() + "\n"
+
+    if had_front_matter or len(task_repos) > 1:
+        text = (
+            "---\n"
+            f"title: {title}\n"
+            f"repos: {', '.join(task_repos)}\n"
+            "---\n\n"
+            f"{task_body}"
+        )
+    else:
+        text = task_body
+
+    queue = Path(config["repos"][destinations[0]]["queue"])
+    base = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{slugify(title)}"
+    path = queue / f"{base}.md"
+    suffix = 2
+    while path.exists():
+        path = queue / f"{base}-{suffix}.md"
+        suffix += 1
+
+    if dry:
+        print(f"would queue {destinations[0]}: {path}")
+        if len(task_repos) > 1:
+            print(f"  repos: {', '.join(task_repos)}")
+        return 0
+
+    queue.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+    print(path)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+
+
+def build_prompt(repo_name: str, task: dict) -> str:
+    sibling = [name for name in task["repos"] if name != repo_name]
+    if sibling:
+        scope = (
+            f"You are the owner of the {repo_name} repository. This is one part "
+            f"of a cross-repository task that also targets: {', '.join(sibling)}.\n"
+            "Work only in this checkout. Each repository has its own worktree and "
+            "branch; do not touch sibling checkouts."
+        )
+    else:
+        scope = (
+            f"You are the owner of the {repo_name} repository.\n"
+            "Work only in this checkout. Do not touch sibling repositories."
+        )
+    return f"""{scope}
+
+Task title: {task['title']}
+
+Task:
+{task['body']}
+
+Do not run sudo, pkexec, systemctl, pacman, mount, or any other privileged
+command. Do not request sandbox escalation. If a step needs root or writes
+outside this checkout, stop and report it instead of prompting the desktop.
+
+When you are done: run the repository tests, commit any changes to the current
+branch, and stop. Do not push or merge anything; the coordinator reviews the
+branch.
+"""
+
+
+def build_maintenance_prompt(repo_name: str, round_no: int,
+                             max_rounds: int) -> str:
+    limit = ("until the window closes" if max_rounds == 0
+             else f"at most {max_rounds} rounds this window")
+    return f"""You are the owner of the {repo_name} repository.
+Work only in this checkout. Do not touch sibling repositories.
+
+There are no queued tasks left. This is maintenance round {round_no}
+({limit}). Do not stop at the first idea; leave the repository better than you
+found it. Review the tests, documentation, TODOs, rough edges, and recent
+changes, then pick ONE concrete improvement, optimization, or polish that is
+safe and testable. Implement it, run the repository tests, and commit it.
+
+If nothing is genuinely worth changing, stop and commit nothing: an empty
+round is a valid result. Do not invent busywork, do not add placeholder files,
+do not rewrite working code for style alone, and do not touch machine secrets.
+If you do find something real, implement it and commit it. Do not push or merge
+anything; the coordinator reviews the branch.
+
+Never run sudo, pkexec, systemctl, pacman, mount, or any privileged command,
+and never request sandbox escalation.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Git and agent lifecycle
+
+
+def branch_taken(repo_path: Path, branch: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(repo_path), "rev-parse", "--verify", "-q",
+         f"refs/heads/{branch}"],
+        capture_output=True, text=True,
+    ).returncode == 0
+
+
+def dirty(repo_path: Path) -> bool:
+    # --no-optional-locks keeps the read-only preflight from refreshing the
+    # repository index; a dry run must not write to the checkout.
+    result = subprocess.run(
+        ["git", "--no-optional-locks", "-C", str(repo_path),
+         "status", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    return bool(result.stdout.strip())
+
+
+def agent_available(config: dict) -> tuple[bool, str]:
+    command = config["agent"]["command"]
+    executable = command[0]
+    if os.sep in executable:
+        path = Path(executable).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return True, ""
+        return False, f"agent executable is missing: {path}"
+    found = shutil.which(executable)
+    if found:
+        return True, ""
+    return False, f"agent executable is missing from PATH: {executable}"
+
+
+def preflight(config: dict, repo_names: list[str]) -> tuple[list[str], dict[str, str]]:
+    eligible: list[str] = []
+    failures: dict[str, str] = {}
+    for name in repo_names:
+        repo = config["repos"].get(name)
+        if repo is None:
+            failures[name] = "unknown repository"
+            continue
+        repo_path = Path(repo["path"])
+        if not repo_path.is_dir():
+            failures[name] = f"missing repo {repo_path}"
+            continue
+        if dirty(repo_path):
+            failures[name] = "dirty working tree"
+            continue
+        eligible.append(name)
+    return eligible, failures
+
+
+def choose_base(config: dict, eligible: list[str], now: datetime,
+                title: str, state_dir: Path) -> tuple[str, str]:
+    """Return a (base, branch) used in every repository of the task.
+
+    The timestamp and slug are shared, so the per-repository branches correlate.
+    A suffix is added only when a branch or worktree already exists.
+    """
+    base_zero = f"{now:%Y%m%d-%H%M%S}-{slugify(title)}"
+    base = base_zero
+    suffix = 2
+    while True:
+        branch = f"agent/{base}"
+        collision = False
+        for name in eligible:
+            repo_path = Path(config["repos"][name]["path"])
+            worktree = state_dir / "worktrees" / name / base
+            if branch_taken(repo_path, branch) or worktree.exists():
+                collision = True
+                break
+        if not collision:
+            return base, branch
+        base = f"{base_zero}-{suffix}"
+        suffix += 1
+
+
+def worktree_path(state_dir: Path, name: str, base: str) -> Path:
+    return state_dir / "worktrees" / name / base
+
+
+def create_group(config: dict, queue_repo: str, task: dict, base: str,
+                 branch: str, eligible: list[str], failures: dict[str, str],
+                 now: datetime, state_dir: Path, events: Path,
+                 maintenance: bool = False, round_no: int = 0) -> dict:
+    group = {
+        "id": base,
+        "title": task.get("title", "task"),
+        "task": str(task["path"]) if task.get("path") else "",
+        "body": task.get("body", ""),
+        "queue_repo": queue_repo,
+        "branch": branch,
+        "repos": list(eligible),
+        "pending": list(eligible),
+        "current": None,
+        "records": {},
+        "failures": dict(failures),
+        "done": [],
+        "maintenance": maintenance,
+        "round": round_no,
+        "started": now.isoformat(),
+    }
+
+    for name in eligible:
+        worktree = worktree_path(state_dir, name, base)
+        repo_path = Path(config["repos"][name]["path"])
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            ["git", "-C", str(repo_path), "worktree", "add", "-b", branch,
+             str(worktree)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[-400:]
+            group["failures"][name] = f"worktree failed: {detail}"
+            group["pending"].remove(name)
+            log(events, f"{base}/{name}: worktree failed: {detail}")
+            continue
+        group["records"][name] = {
+            "worktree": str(worktree),
+            "branch": branch,
+            "pid": 0,
+            "boot": "",
+            "log": "",
+        }
+
+    return group
+
+
+def launch_agent(config: dict, group: dict, name: str, state_dir: Path,
+                 events: Path, now: datetime) -> bool:
+    record = group["records"].get(name)
+    if record is None:
+        return False
+
+    log_path = state_dir / "logs" / f"{group['id']}-{name}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt = (build_maintenance_prompt(name, group["round"],
+                                       int(config["maintenance"].get(
+                                           "max_rounds_per_window", 0)))
+              if group.get("maintenance")
+              else build_prompt(name, {
+                  "title": group["title"],
+                  "body": group.get("body", ""),
+                  "repos": group["repos"],
+              }))
+    command = list(config["agent"]["command"]) + [prompt]
+
+    try:
+        with log_path.open("wb") as output:
+            process = subprocess.Popen(
+                command,
+                cwd=record["worktree"],
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=os.environ.copy(),
+            )
+    except OSError as exc:
+        group["failures"][name] = f"agent failed to start: {exc}"
+        log(events, f"{group['id']}/{name}: agent failed to start: {exc}")
+        return False
+
+    record.update({
+        "pid": process.pid,
+        "boot": boot_id(),
+        "log": str(log_path),
+        "started": now.isoformat(),
+    })
+    group["current"] = name
+    log(events, f"{group['id']}/{name}: started {group['branch']} "
+                f"(pid {process.pid})")
+    return True
+
+
+def launch_pending(config: dict, group: dict, state_dir: Path, events: Path,
+                   now: datetime) -> bool:
+    """Launch the next repository agent; only one runs at a time."""
+    while group["pending"]:
+        name = group["pending"].pop(0)
+        if name not in group["records"]:
+            continue
+        if launch_agent(config, group, name, state_dir, events, now):
+            return True
+    return False
+
+
+def run_tests(repo: dict, worktree: Path, events: Path,
+              name: str) -> tuple[str, bool]:
+    tests = repo.get("tests") or []
+    if not tests:
+        return "not configured", True
+    try:
+        result = subprocess.run(
+            tests, cwd=str(worktree), capture_output=True, text=True,
+            timeout=TEST_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        log(events, f"{name}: tests timed out")
+        return "timed out", False
+    except OSError as exc:
+        log(events, f"{name}: tests could not run: {exc}")
+        return f"could not run: {exc}", False
+    log(events, f"{name}: tests exit {result.returncode}")
+    if result.returncode != 0:
+        output = (result.stdout[-1500:] + result.stderr[-1500:]).strip()
+        log(events, f"{name}: test output:\n{output}")
+        return f"exit {result.returncode}", False
+    return f"exit {result.returncode}", True
+
+
+def commits_ahead(worktree: Path) -> int:
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "rev-list", "--count",
+         f"{BASE_BRANCH}..HEAD"],
+        capture_output=True, text=True,
+    )
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return 0
+
+
+def open_draft_pr(group: dict, name: str, repo: dict, worktree: Path,
+                  branch: str, test_status: str, events: Path) -> bool:
+    """Create an opt-in draft PR after a successful branch push.
+
+    Deliberately narrow: no ready-for-review transition, no merge, no PR when
+    the branch has no commits, and no PR when one already exists. Multi-repo
+    PRs carry the shared task group and sibling branches in their body.
+    """
+    if not repo.get("open_pr"):
+        return False
+    if not branch.startswith("agent/") or branch == BASE_BRANCH:
+        log(events, f"{name}: refusing to open a PR from {branch!r}")
+        return False
+    if not shutil.which("gh"):
+        log(events, f"{name}: open_pr requested but gh is not installed")
+        return False
+
+    commits = commits_ahead(worktree)
+    if commits <= 0:
+        log(events, f"{name}: no commits ahead of {BASE_BRANCH}; skipping pull request")
+        return False
+
+    existing = subprocess.run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open",
+         "--json", "number", "--jq", "length"],
+        cwd=str(worktree), capture_output=True, text=True,
+    )
+    if existing.returncode != 0 or existing.stdout.strip() != "0":
+        log(events, f"{name}: open PR exists or could not be checked; skipping pull request")
+        return False
+
+    lines = [
+        f"Automated agent output for: {group['title']}",
+        "",
+        f"Task: {group.get('task') or 'maintenance'}",
+        f"Task group: {group['id']}",
+        f"Repositories: {', '.join(group['repos'])}",
+        f"Tests ({name}): {test_status}",
+        "",
+        "Branches:",
+    ]
+    for sibling in group["repos"]:
+        record = group["records"].get(sibling, {})
+        marker = " (this PR)" if sibling == name else ""
+        lines.append(f"- {sibling}: `{record.get('branch', branch)}`{marker}")
+    if group.get("failures"):
+        lines.append("")
+        lines.append("Failures:")
+        for failed, reason in sorted(group["failures"].items()):
+            lines.append(f"- {failed}: {reason}")
+    lines += [
+        "",
+        "Draft PR created by the numeric-lua scheduler. Review before merging; "
+        "the scheduler never merges or marks it ready for review.",
+    ]
+    body = "\n".join(lines)
+
+    proc = subprocess.run(
+        ["gh", "pr", "create", "--draft", "--base", BASE_BRANCH,
+         "--head", branch, "--title", f"agent: {group['title']}",
+         "--body", body],
+        cwd=str(worktree), capture_output=True, text=True,
+    )
+    if proc.returncode == 0:
+        url = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else branch
+        log(events, f"{name}: opened draft PR {url}")
+        return True
+    detail = (proc.stderr or proc.stdout).strip()[-500:]
+    log(events, f"{name}: draft PR creation failed: {detail}")
+    return False
+
+
+def finalize_repo(config: dict, group: dict, name: str, state_dir: Path,
+                  events: Path) -> None:
+    record = group["records"].get(name)
+    if record is None:
+        group["failures"][name] = "no worktree record"
+        group["current"] = None
+        return
+    if record.get("finished"):
+        group["current"] = None
+        return
+
+    worktree = Path(record["worktree"])
+    repo = config["repos"].get(name, {})
+    test_status = "not run"
+    push_ok = False
+
+    if not worktree.is_dir():
+        group["failures"][name] = "worktree is missing at finalize time"
+        log(events, f"{group['id']}/{name}: worktree is missing")
+    else:
+        test_status, tests_ok = run_tests(repo, worktree, events, name)
+        if not tests_ok:
+            group["failures"][name] = f"tests {test_status}"
+
+        status = subprocess.run(
+            ["git", "-C", str(worktree), "status", "--porcelain"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if status:
+            subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=False)
+            commit = subprocess.run(
+                ["git", "-C", str(worktree), "commit", "-m",
+                 f"agent: {group.get('title', 'task')}"],
+                capture_output=True, text=True,
+            )
+            if commit.returncode == 0:
+                log(events, f"{group['id']}/{name}: committed WIP on "
+                            f"{group['branch']}")
+            else:
+                detail = (commit.stderr or commit.stdout).strip()[-400:]
+                group["failures"][name] = f"commit failed: {detail}"
+                log(events, f"{group['id']}/{name}: commit failed: {detail}")
+
+        if repo.get("push"):
+            branch = record.get("branch", "")
+            if not branch.startswith("agent/"):
+                group["failures"][name] = f"refusing to push {branch!r}"
+                log(events, f"{group['id']}/{name}: refusing to push {branch!r}")
+            else:
+                pushed = subprocess.run(
+                    ["git", "-C", str(worktree), "push", "-u", "origin", branch],
+                    capture_output=True, text=True,
+                )
+                push_ok = pushed.returncode == 0
+                log(events, f"{group['id']}/{name}: "
+                            f"{'pushed' if push_ok else 'push failed'} {branch}")
+                if not push_ok:
+                    detail = (pushed.stderr or pushed.stdout).strip()[-400:]
+                    group["failures"][name] = f"push failed: {detail}"
+
+        if push_ok:
+            if not open_draft_pr(group, name, repo, worktree,
+                                 record["branch"], test_status, events):
+                group["failures"].setdefault(name, "draft PR not opened")
+
+        record["test_status"] = test_status
+        record["commits_ahead"] = commits_ahead(worktree)
+
+    record["finished"] = datetime.now().astimezone().isoformat()
+    record["test_ok"] = test_status.startswith("exit 0") or test_status == "not configured"
+    group["current"] = None
+    if name not in group["done"]:
+        group["done"].append(name)
+
+
+def move_task_done(task_path: str) -> None:
+    if not task_path:
+        return
+    task = Path(task_path)
+    if not task.is_file():
+        return
+    done = task.parent / "done"
+    done.mkdir(parents=True, exist_ok=True)
+    target = done / f"{datetime.now():%Y%m%d-%H%M%S}-{task.name}"
+    shutil.move(str(task), target)
+
+
+def finalize_group(config: dict, group: dict, state_dir: Path, events: Path,
+                   reason: str = "not started") -> None:
+    for name in list(group.get("pending", [])):
+        group["failures"].setdefault(name, reason)
+    group["pending"] = []
+
+    move_task_done(group.get("task", ""))
+
+    state = load_state(state_dir / "state.json")
+    state.setdefault("running", {}).pop(group["id"], None)
+    state.setdefault("finished", []).append({
+        "id": group["id"],
+        "title": group.get("title", ""),
+        "task": group.get("task", ""),
+        "branch": group.get("branch", ""),
+        "repos": group.get("repos", []),
+        "done": group.get("done", []),
+        "failures": group.get("failures", {}),
+        "maintenance": bool(group.get("maintenance")),
+        "finished": datetime.now().astimezone().isoformat(),
+    })
+    state["finished"] = state["finished"][-50:]
+    save_state(state_dir / "state.json", state)
+    log(events, f"{group['id']}: finalized"
+                + (f" with failures: {group['failures']}" if group.get("failures") else ""))
+
+
+def stop_and_finalize(config: dict, state_dir: Path, events: Path,
+                      dry: bool) -> None:
+    state = load_state(state_dir / "state.json")
+    groups = list(state.get("running", {}).values())
+    if not groups:
+        return
+    if dry:
+        for group in groups:
+            print(f"would stop: {group.get('id')} "
+                  f"({', '.join(group.get('repos', [])) or 'no repos'})")
+        return
+
+    current_boot = boot_id()
+    pids: list[int] = []
+    for group in groups:
+        name = group.get("current")
+        if not name or name not in group.get("records", {}):
+            continue
+        record = group["records"][name]
+        pid = int(record.get("pid", 0))
+        if record.get("boot") and current_boot and record["boot"] != current_boot:
+            log(events, f"{group['id']}/{name}: agent is from an earlier boot; "
+                        f"not signalling pid {pid}")
+            continue
+        if pid <= 0:
+            continue
+        log(events, f"{group['id']}/{name}: stopping pid {pid}")
+        stop_group(pid)
+        pids.append(pid)
+
+    grace = int(config.get("schedule", {}).get("stop_grace_seconds", 20))
+    if pids and not wait_for_exit(pids, grace):
+        for pid in pids:
+            log(events, f"pid {pid}: ignored SIGTERM; killing")
+            stop_group(pid, signal.SIGKILL)
+        wait_for_exit(pids, 5)
+
+    for group in groups:
+        name = group.get("current")
+        if name and name in group.get("records", {}):
+            finalize_repo(config, group, name, state_dir, events)
+        finalize_group(config, group, state_dir, events,
+                       reason="stopped before launch")
+
+
+def save_running_group(state_dir: Path, group: dict) -> None:
+    state = load_state(state_dir / "state.json")
+    state.setdefault("running", {})[group["id"]] = group
+    save_state(state_dir / "state.json", state)
+
+
+def acquire_lock(path: Path):
+    """Return a held exclusive lock handle, or None when another tick has it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
+# ---------------------------------------------------------------------------
+# Planning and ticking
+
+
+def plan_group(config: dict, repo_names: list[str], title: str, now: datetime,
+               state_dir: Path) -> tuple[list[str], str, str, dict[str, str]]:
+    eligible, failures = preflight(config, repo_names)
+    if not eligible:
+        return [], "", "", failures
+    base, branch = choose_base(config, eligible, now, title, state_dir)
+    return eligible, base, branch, failures
+
+
+def print_plan(name: str, eligible: list[str], base: str, branch: str,
+               failures: dict[str, str], state_dir: Path) -> None:
+    for repo_name in eligible:
+        worktree = worktree_path(state_dir, repo_name, base)
+        print(f"would start {repo_name}: {branch} in {worktree}")
+    for repo_name, reason in sorted(failures.items()):
+        print(f"would skip {repo_name}: {reason}")
+
+
+def report_task_errors(errors: list[tuple[Path, str]], events: Path,
+                       dry: bool) -> None:
+    for path, message in errors:
+        if dry:
+            print(f"warning: {message}")
+        else:
+            log(events, f"invalid task {path.name}: {message}")
+
+
+def tick(config: dict, state_dir: Path, dry: bool, events: Path) -> None:
+    now = datetime.now(timezone.utc)
+    active = window_at(config, now)
+    margin = timedelta(minutes=int(config["schedule"].get("stop_margin_minutes", 30)))
+
+    if active is None:
+        print("outside a discount window")
+        stop_and_finalize(config, state_dir, events, dry)
+        return
+
+    start, end = active
+    latest = end - margin
+    print(f"window {start.isoformat()} → {end.isoformat()} "
+          f"(stop by {latest.isoformat()})")
+    if now >= latest:
+        print("inside the stop margin; stopping agents")
+        stop_and_finalize(config, state_dir, events, dry)
+        return
+
+    state = load_state(state_dir / "state.json")
+    groups = list(state.get("running", {}).values())
+
+    if groups:
+        group = groups[0]
+        name = group.get("current")
+        if dry:
+            if name and name in group.get("records", {}):
+                pid = int(group["records"][name].get("pid", 0))
+                if alive(pid):
+                    print(f"would wait: {name} is still running")
+                    return
+                print(f"would finalize {name} and continue {group['branch']}")
+            for pending in group.get("pending", []):
+                print(f"would start {pending}: {group['branch']}")
+            return
+
+        if name and name in group.get("records", {}):
+            record = group["records"][name]
+            pid = int(record.get("pid", 0))
+            current_boot = boot_id()
+            on_other_boot = bool(record.get("boot") and current_boot
+                                 and record["boot"] != current_boot)
+            if on_other_boot:
+                log(events, f"{group['id']}/{name}: agent is from an earlier "
+                            f"boot; finalizing without signalling pid {pid}")
+                finalize_repo(config, group, name, state_dir, events)
+                save_running_group(state_dir, group)
+            elif alive(pid):
+                print(f"agent already running: {name}; one at a time")
+                return
+            else:
+                log(events, f"{group['id']}/{name}: agent exited")
+                finalize_repo(config, group, name, state_dir, events)
+                save_running_group(state_dir, group)
+
+        if group.get("pending"):
+            after = datetime.now(timezone.utc)
+            if after >= latest:
+                print("inside the stop margin; not launching another repository")
+                finalize_group(config, group, state_dir, events,
+                               reason="stop margin reached before launch")
+                return
+            if launch_pending(config, group, state_dir, events, after):
+                save_running_group(state_dir, group)
+                print(f"started next repository: {group['current']}")
+                return
+            finalize_group(config, group, state_dir, events,
+                           reason="agent failed to start")
+            return
+
+        finalize_group(config, group, state_dir, events)
+        return
+
+    max_tasks = int(config["schedule"].get("max_tasks_per_day", 0))
+    if max_tasks:
+        task_day = promo_day_key(now)
+        task_info = state.setdefault("tasks", {})
+        if task_info.get("day") != task_day:
+            task_info.clear()
+            task_info.update({"day": task_day, "count": 0})
+        if int(task_info.get("count", 0)) >= max_tasks:
+            print(f"daily task limit reached ({max_tasks})")
+            return
+
+    order = list(config["repos"])
+    if not order:
+        print("no repositories configured")
+        return
+    rotation = int(state.get("rotation", 0)) % len(order)
+    maintenance_cfg = config["maintenance"]
+    window_key = start.isoformat()
+
+    for offset in range(len(order)):
+        idx = (rotation + offset) % len(order)
+        name = order[idx]
+        repo = config["repos"][name]
+
+        task, errors = find_next_task(config, name)
+        report_task_errors(errors, events, dry)
+        if task is not None:
+            agent_ok, agent_reason = agent_available(config)
+            if not agent_ok:
+                if dry:
+                    print(f"would skip {name}: {agent_reason}")
+                else:
+                    log(events, f"{name}: {agent_reason}; not launching")
+                    print(f"{name}: {agent_reason}")
+                continue
+
+            eligible, base, branch, failures = plan_group(
+                config, task["repos"], task["title"], now, state_dir,
+            )
+            if not eligible:
+                if dry:
+                    print(f"would skip {name}: no eligible repository")
+                    for failed, reason in sorted(failures.items()):
+                        print(f"  {failed}: {reason}")
+                else:
+                    log(events, f"{name}: task {task['path'].name} has no "
+                                f"eligible repository: {failures}")
+                    print(f"{name}: task cannot start: {failures}")
+                continue
+
+            if dry:
+                print_plan(name, eligible, base, branch, failures, state_dir)
+                print(f"  task: {task['path']}")
+                return
+
+            group = create_group(
+                config, name, task, base, branch, eligible, failures,
+                now, state_dir, events,
+            )
+            if not group["records"]:
+                log(events, f"{name}: could not create any worktree for "
+                            f"{task['path'].name}")
+                continue
+            if group["pending"]:
+                launch_pending(config, group, state_dir, events, now)
+
+            state = load_state(state_dir / "state.json")
+            state.setdefault("running", {})[group["id"]] = group
+            state["rotation"] = (idx + 1) % len(order)
+            if max_tasks and group.get("current"):
+                info = state.setdefault("tasks", {})
+                day = promo_day_key(now)
+                if info.get("day") != day:
+                    info.clear()
+                    info.update({"day": day, "count": 0})
+                info["count"] = int(info.get("count", 0)) + 1
+            save_state(state_dir / "state.json", state)
+            log(events, f"{name}: task {task['path'].name} started as "
+                        f"{group['branch']}")
+            if group.get("current") is None:
+                finalize_group(config, group, state_dir, events,
+                               reason="agent failed to start")
+            return
+
+        if not maintenance_cfg.get("enabled", False):
+            print(f"{name}: queue empty (maintenance disabled)")
+            continue
+
+        info = state.setdefault("maintenance", {}).setdefault(name, {})
+        if info.get("window") != window_key:
+            info.clear()
+            info.update({"window": window_key, "rounds": 0, "last": 0.0})
+
+        rounds = int(info.get("rounds", 0))
+        max_rounds = int(maintenance_cfg.get("max_rounds_per_window", 0))
+        if max_rounds and rounds >= max_rounds:
+            print(f"{name}: maintenance limit reached ({max_rounds})")
+            continue
+
+        min_seconds = int(maintenance_cfg.get("min_round_seconds", 900))
+        last = float(info.get("last", 0.0))
+        if last and now.timestamp() - last < min_seconds:
+            remaining = int(min_seconds - (now.timestamp() - last))
+            print(f"{name}: next maintenance in {remaining}s")
+            continue
+
+        agent_ok, agent_reason = agent_available(config)
+        if not agent_ok:
+            if dry:
+                print(f"would skip {name}: {agent_reason}")
+            else:
+                log(events, f"{name}: {agent_reason}; not launching maintenance")
+                print(f"{name}: {agent_reason}")
+            continue
+
+        round_no = rounds + 1
+        title = f"maintenance-{round_no}"
+        eligible, base, branch, failures = plan_group(
+            config, [name], title, now, state_dir,
+        )
+        if not eligible:
+            if dry:
+                print(f"would skip {name}: no eligible repository")
+            else:
+                log(events, f"{name}: maintenance is not launchable: {failures}")
+            continue
+
+        if dry:
+            print_plan(name, eligible, base, branch, failures, state_dir)
+            print(f"  maintenance round {round_no}")
+            return
+
+        task = {"path": None, "title": title, "body": "", "repos": [name]}
+        group = create_group(
+            config, name, task, base, branch, eligible, failures,
+            now, state_dir, events, maintenance=True, round_no=round_no,
+        )
+        if not group["records"]:
+            log(events, f"{name}: could not create the maintenance worktree")
+            continue
+        if group["pending"]:
+            launch_pending(config, group, state_dir, events, now)
+
+        state = load_state(state_dir / "state.json")
+        state.setdefault("running", {})[group["id"]] = group
+        info = state.setdefault("maintenance", {}).setdefault(name, {})
+        if info.get("window") != window_key:
+            info.clear()
+            info.update({"window": window_key, "rounds": 0, "last": 0.0})
+        info["last"] = now.timestamp()
+        if group.get("current"):
+            info["rounds"] = round_no
+            if max_tasks:
+                info_tasks = state.setdefault("tasks", {})
+                day = promo_day_key(now)
+                if info_tasks.get("day") != day:
+                    info_tasks.clear()
+                    info_tasks.update({"day": day, "count": 0})
+                info_tasks["count"] = int(info_tasks.get("count", 0)) + 1
+        state["rotation"] = (idx + 1) % len(order)
+        save_state(state_dir / "state.json", state)
+        log(events, f"{name}: maintenance round {round_no} started as "
+                    f"{group['branch']}")
+        if group.get("current") is None:
+            finalize_group(config, group, state_dir, events,
+                           reason="agent failed to start")
+        return
+
+    if dry:
+        print("no repository is ready to launch")
+    else:
+        state = load_state(state_dir / "state.json")
+        state["rotation"] = (rotation + 1) % len(order)
+        save_state(state_dir / "state.json", state)
+        print("no repository is ready to launch")
+
+
+# ---------------------------------------------------------------------------
+# Status and CLI
+
+
+def status(config: dict, state_dir: Path) -> None:
+    now = datetime.now(timezone.utc)
+    active = window_at(config, now)
+    print(f"now: {now.isoformat()}")
+    print(f"window: {'none' if active is None else active[0].isoformat() + ' → ' + active[1].isoformat()}")
+    print(f"lock: {config['lock']['path']}")
+    print(f"state: {state_dir}")
+    state = load_state(state_dir / "state.json")
+    groups = list(state.get("running", {}).values())
+    maintenance_state = state.get("maintenance", {})
+    window_key = active[0].isoformat() if active else None
+
+    if groups:
+        for group in groups:
+            current = group.get("current") or "none"
+            print(f"running group: {group['id']} ({group['title']})")
+            print(f"  branch: {group.get('branch')}")
+            print(f"  current: {current}")
+            print(f"  pending: {', '.join(group.get('pending', [])) or 'none'}")
+            if group.get("failures"):
+                print(f"  failures: {group['failures']}")
+    else:
+        print("running: none")
+
+    max_tasks = int(config["schedule"].get("max_tasks_per_day", 0))
+    if max_tasks:
+        day = promo_day_key(now)
+        tasks = state.get("tasks", {})
+        count = int(tasks.get("count", 0)) if tasks.get("day") == day else 0
+        print(f"tasks: {count}/{max_tasks} this promo day")
+
+    for name in config["repos"]:
+        task, errors = find_next_task(config, name)
+        in_group = any(name in group.get("repos", []) for group in groups)
+        if in_group:
+            display = "running" if any(
+                group.get("current") == name for group in groups
+            ) else "pending"
+        elif task:
+            extra = ""
+            if len(task["repos"]) > 1:
+                extra = f" [repos: {', '.join(task['repos'])}]"
+            display = f"queued ({task['path'].name}){extra}"
+        elif errors:
+            display = f"invalid task ({errors[0][0].name})"
+        elif config["maintenance"].get("enabled", False):
+            info = maintenance_state.get(name, {})
+            if info.get("window") == window_key:
+                display = f"maintenance ({int(info.get('rounds', 0))} this window)"
+            else:
+                display = "maintenance"
+        else:
+            display = "empty"
+        print(f"{name}: {display}")
+
+
+def print_config(config: dict) -> None:
+    print(json.dumps(config, indent=2, sort_keys=True, default=str))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=config_default())
+    parser.add_argument("--state-dir", type=Path, default=state_dir_default())
+    parser.add_argument("--once", action="store_true",
+                        help="run exactly one tick (the default)")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--stop", action="store_true")
+    parser.add_argument("--daemon", action="store_true")
+    parser.add_argument("--print-config", action="store_true",
+                        help="print the resolved configuration as JSON")
+    parser.add_argument("--enqueue", metavar="REPO[,REPO...]",
+                        help="queue a task for one or more repositories "
+                             "(body from stdin or --body)")
+    parser.add_argument("--title",
+                        help="task title when the body has no heading")
+    parser.add_argument("--body", help="task body; defaults to stdin")
+    args = parser.parse_args()
+
+    if args.daemon and args.once:
+        parser.error("--daemon and --once are mutually exclusive")
+    if (args.title or args.body) and not args.enqueue:
+        parser.error("--title and --body are only used with --enqueue")
+    if args.enqueue and (args.status or args.stop or args.once or args.daemon
+                         or args.print_config):
+        parser.error("--enqueue cannot be combined with --status/--stop/"
+                     "--once/--daemon/--print-config")
+    if args.daemon and args.dry_run:
+        parser.error("--daemon and --dry-run are mutually exclusive")
+
+    config_path = expand(args.config)
+    state_dir = expand(args.state_dir)
+    if not config_path.is_file():
+        print(f"promo-agents: no config at {config_path}", file=sys.stderr)
+        return 2
+
+    config = load_config(config_path)
+    events = state_dir / "agents.log"
+
+    if args.enqueue:
+        body = args.body or ""
+        if not body and not sys.stdin.isatty():
+            body = sys.stdin.read()
+        return enqueue(config, args.enqueue, args.title, body, args.dry_run)
+
+    if args.print_config:
+        print_config(config)
+        return 0
+    if args.status:
+        status(config, state_dir)
+        return 0
+
+    if args.dry_run:
+        if args.stop:
+            stop_and_finalize(config, state_dir, events, True)
+        else:
+            tick(config, state_dir, True, events)
+        return 0
+
+    lock_path = Path(config["lock"]["path"])
+    lock = acquire_lock(lock_path)
+    if lock is None:
+        print("another scheduler tick is running", file=sys.stderr)
+        return 0
+    with lock:
+        if args.stop:
+            stop_and_finalize(config, state_dir, events, False)
+            return 0
+        if args.daemon:
+            while True:
+                tick(config, state_dir, False, events)
+                time.sleep(30)
+        tick(config, state_dir, False, events)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

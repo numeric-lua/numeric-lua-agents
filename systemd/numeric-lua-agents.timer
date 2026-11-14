@@ -1,0 +1,29 @@
+[Unit]
+Description=Tick the numeric-lua promo-window scheduler
+
+[Timer]
+# Every five minutes across both off-peak windows, 10:00-01:00 and
+# 04:00-06:00 UTC. Re-check the provider's current schedule before enabling:
+# https://api-docs.deepseek.com/news/news260813
+OnCalendar=*-*-* 10:00/5 UTC
+OnCalendar=*-*-* 11:00/5 UTC
+OnCalendar=*-*-* 12:00/5 UTC
+OnCalendar=*-*-* 13:00/5 UTC
+OnCalendar=*-*-* 14:00/5 UTC
+OnCalendar=*-*-* 15:00/5 UTC
+OnCalendar=*-*-* 16:00/5 UTC
+OnCalendar=*-*-* 17:00/5 UTC
+OnCalendar=*-*-* 18:00/5 UTC
+OnCalendar=*-*-* 19:00/5 UTC
+OnCalendar=*-*-* 20:00/5 UTC
+OnCalendar=*-*-* 21:00/5 UTC
+OnCalendar=*-*-* 22:00/5 UTC
+OnCalendar=*-*-* 23:00/5 UTC
+OnCalendar=*-*-* 00:00/5 UTC
+OnCalendar=*-*-* 04:00/5 UTC
+OnCalendar=*-*-* 05:00/5 UTC
+AccuracySec=30s
+Unit=numeric-lua-agents.service
+
+[Install]
+WantedBy=timers.target

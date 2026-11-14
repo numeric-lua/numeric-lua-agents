@@ -1,0 +1,97 @@
+# numeric-lua promo-window scheduler configuration.
+#
+# Copy to ~/.config/numeric-lua/agents.toml and adjust:
+#
+#   mkdir -p ~/.config/numeric-lua/agents/queue/luatorch
+#   install -m 600 example.toml ~/.config/numeric-lua/agents.toml
+#
+# Defaults are deliberately conservative: at most one agent at a time,
+# push = false, open_pr = false, and maintenance disabled. Keep them that way
+# until several agent branches have been reviewed by the coordinator.
+#
+# PROMO-HOUR WARNING: the windows below are configuration, not a hardcoded
+# promise. DeepSeek's published peak/off-peak hours change. Verify the current
+# schedule before enabling the timer:
+#   https://api-docs.deepseek.com/news/news260813
+#   https://api-docs.deepseek.com/quick_start/pricing
+# The example uses the two off-peak windows from the Maria Padilha scheduler
+# (10:00-01:00 and 04:00-06:00 UTC). They are placeholders until re-checked.
+
+[schedule]
+timezone = "UTC"
+# No launch after the margin, and a running agent is terminated at it, so no
+# work bills outside the discount. Keep this generous.
+stop_margin_minutes = 5
+# SIGTERM at the margin, then SIGKILL after this many seconds.
+stop_grace_seconds = 20
+# Counts tasks, not repositories: one cross-repo task counts once.
+max_tasks_per_day = 5
+
+[[schedule.windows]]
+days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+start = "10:00"
+end = "01:00"
+
+[[schedule.windows]]
+days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+start = "04:00"
+end = "06:00"
+
+
+[agent]
+# The scheduler replaces `dsh` with a shell stub in the test suite. A headless
+# profile auto-initializes under ~/.dsh on first use; credentials stay there or
+# in a mode-600 agents.env file, never in this repository.
+command = ["dsh", "--profile", "headless"]
+
+
+[maintenance]
+# Opt-in. With this false, an empty queue means the window idles and the
+# coordinator decides what is worth doing.
+enabled = false
+# 0 keeps doing maintenance rounds until the stop margin. A positive number
+# caps rounds per window.
+max_rounds_per_window = 0
+# Minimum gap between rounds, so a fast failure cannot spin.
+min_round_seconds = 900
+
+
+[lock]
+# Held for the entire tick and for a --daemon lifetime. All numeric-lua
+# scheduler configs must use this same path or they can overlap. The Maria
+# Padilha scheduler uses its own hardcoded lock and does not share this one;
+# run only one scheduler until both honor the same lock (see README).
+path = "~/.local/state/numeric-lua/agents.lock"
+
+
+# Repository ids key the queue entries and the cross-repo `repos:` list.
+# After the organization transfer these are the canonical paths. Until
+# luatorch moves, point its `path` at ~/Códigos/luatorch; the scheduler fails
+# closed on a missing checkout, and --dry-run only reports it.
+[repos.luatorch]
+path = "~/Códigos/numeric-lua/luatorch"
+queue = "~/.config/numeric-lua/agents/queue/luatorch"
+tests = ["./scripts/test.sh"]
+push = false
+open_pr = false
+
+[repos.numlua]
+path = "~/Códigos/numeric-lua/numlua"
+queue = "~/.config/numeric-lua/agents/queue/numlua"
+tests = ["./scripts/test.sh"]
+push = false
+open_pr = false
+
+[repos.luaplotlib]
+path = "~/Códigos/numeric-lua/luaplotlib"
+queue = "~/.config/numeric-lua/agents/queue/luaplotlib"
+tests = ["./scripts/test.sh"]
+push = false
+open_pr = false
+
+[repos.tensorlua]
+path = "~/Códigos/numeric-lua/tensorlua"
+queue = "~/.config/numeric-lua/agents/queue/tensorlua"
+tests = ["./scripts/test.sh"]
+push = false
+open_pr = false

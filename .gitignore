@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.tmp
+.venv/
+venv/
+
+# Local scratch state; the real state lives under ~/.local/state/numeric-lua.
+/state/
+/worktrees/
+*.log
+.env
+agents.env
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

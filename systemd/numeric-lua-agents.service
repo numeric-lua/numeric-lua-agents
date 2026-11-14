@@ -1,0 +1,23 @@
+[Unit]
+Description=numeric-lua promo-window agent tick
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+KillMode=process
+User=machine
+Group=machine
+Environment=HOME=/home/machine
+Environment=PATH=/home/machine/.npm-global/bin:/home/machine/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/home/machine/.config/numeric-lua/agents.env
+Environment=GIT_TERMINAL_PROMPT=0
+WorkingDirectory=/home/machine/Códigos/numeric-lua/numeric-lua-agents
+ExecStart=/usr/bin/python3 /home/machine/Códigos/numeric-lua/numeric-lua-agents/promo-agents --config /home/machine/.config/numeric-lua/agents.toml --once
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+# Finalizing an agent commits its work and runs repository tests. Those tests
+# can legitimately take several minutes; a short timeout would kill the tick
+# mid-finalization and leave the running record stuck.
+TimeoutStartSec=900
