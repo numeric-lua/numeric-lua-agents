@@ -5,9 +5,11 @@ shipped with any library; it schedules headless DSH agents during provider
 discount ("promo") hours so the coordinator can review small, focused changes.
 
 The scheduler is adapted from the Maria Padilha scheduler. It preserves the
-same safety model — one agent at a time, worktrees and branches, draft PRs only,
-never a push or merge to `main`, a stop margin, state under the user's
-config/state directories, and a dry run that writes nothing — and adds:
+same safety model — one agent at a time, worktrees and branches, a stop margin,
+state under the user's config/state directories, and a dry run that writes
+nothing — and adds optional pushed branches, draft PRs, or tested fast-forwards
+to `main`. Pushes are disabled by default; direct-main mode requires both
+`push = true` and `push_main = true`.
 
 1. tasks that may name several repositories;
 2. a configurable host-wide `fcntl.flock` held for the whole tick.
@@ -16,7 +18,9 @@ config/state directories, and a dry run that writes nothing — and adds:
 window. Repositories are picked round-robin. The agent works in a throwaway git
 worktree on `agent/<timestamp>-<slug>`; the scheduler stops it before the
 window closes, runs the repository's tests, commits whatever is left, and
-leaves the branch for review. It never pushes `main` and never merges.
+leaves the branch for review. With `push_main = true` it first requires the
+tests to pass, fast-forwards the main checkout, and pushes `origin/main`; a
+dirty or diverged main is reported instead of forced.
 
 The scheduler does not invent work. The coordinator (the human plus the main
 DSH session) owns the queues. An empty queue idles unless maintenance rounds
@@ -193,9 +197,9 @@ against `max_tasks_per_day`.
    creation failure is recorded per repository; the others continue.
 3. Starts one agent for the first repository. The others wait.
 4. On a later tick, when that agent exits, runs that repository's tests,
-   commits any changes on the same branch, optionally pushes, and optionally
-   opens a draft PR. Then it starts the next repository's agent, still one at a
-   time.
+   commits any changes on the same branch, optionally pushes the branch,
+   opens a draft PR, or fast-forwards `main` when `push_main = true`. Then it
+   starts the next repository's agent, still one at a time.
 5. When all repositories are done (or stopped at the margin), the task moves to
    `done/` and a summary with per-repository failures is written to state.
    Worktrees and branches are preserved for review.
@@ -312,8 +316,9 @@ finalization tests to finish.
 
 ## Operational rules
 
-- Keep `push = false` and `open_pr = false` until branches have been reviewed
-  repeatedly. The worktrees survive for inspection either way.
+- Defaults keep `push = false`, `open_pr = false`, and `push_main = false`.
+  Enable direct-main mode only with explicit coordinator authorization; the
+  branch and worktree survive even if the fast-forward fails.
 - Keep a generous stop margin. A hard kill can leave uncommitted work; the
   scheduler commits what it can, but no guarantee is absolute.
 - Never put credentials, tokens, or private screenshots in a task, prompt,
