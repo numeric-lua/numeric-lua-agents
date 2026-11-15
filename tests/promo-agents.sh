@@ -170,6 +170,7 @@ EOF
 
 write_pair() {
     local name=$1 start=$2 end=$3 push=$4 open_pr=$5 tests_a=$6 tests_b=$7
+    local push_main=${8:-false}
     cat > "$tmp/$name.toml" <<EOF
 [schedule]
 timezone = "UTC"
@@ -196,6 +197,7 @@ queue = "$tmp/$name-qa"
 tests = ["sh", "$tests_a"]
 push = $push
 open_pr = $open_pr
+push_main = $push_main
 
 [repos.beta]
 path = "$tmp/$name-beta"
@@ -203,6 +205,7 @@ queue = "$tmp/$name-qb"
 tests = ["sh", "$tests_b"]
 push = $push
 open_pr = $open_pr
+push_main = $push_main
 EOF
 }
 
@@ -969,6 +972,43 @@ if ! grep -q 'pr merge' "$GH_LOG" && ! grep -q 'pr ready' "$GH_LOG"; then
     ok "the scheduler never merges or marks a PR ready"
 else
     bad "the scheduler never merges or marks a PR ready" "$(cat "$GH_LOG")"
+fi
+
+echo "direct main fast-forward"
+
+make_repo "$tmp/mainpush-alpha"
+make_repo "$tmp/mainpush-beta"
+make_origin "$tmp/mainpush-alpha" "$tmp/mainpush-alpha-origin.git"
+make_origin "$tmp/mainpush-beta" "$tmp/mainpush-beta-origin.git"
+mkdir -p "$tmp/mainpush-qa" "$tmp/mainpush-qb"
+write_pair mainpush "$inside_start" "$inside_end" true false     "$tmp/test-ok.sh" "$tmp/test-ok.sh" true
+cat > "$tmp/mainpush-qa/001-main.md" <<'EOF'
+---
+title: Direct main task
+repos: alpha, beta
+---
+Land tested work on main.
+EOF
+DSH_INVOCATIONS="$tmp/dsh-mainpush.log" \
+    "$agents" --config "$tmp/mainpush.toml" --state-dir "$tmp/state-mainpush" --once \
+    > /dev/null 2>&1
+wait_for_agent_exit "$tmp/state-mainpush/state.json"
+"$agents" --config "$tmp/mainpush.toml" --state-dir "$tmp/state-mainpush" --once \
+    > /dev/null 2>&1
+wait_for_agent_exit "$tmp/state-mainpush/state.json"
+"$agents" --config "$tmp/mainpush.toml" --state-dir "$tmp/state-mainpush" --once \
+    > /dev/null 2>&1
+a_branch=$(agent_branch "$tmp/mainpush-alpha")
+a_main=$(git -C "$tmp/mainpush-alpha-origin.git" rev-parse main)
+a_branch_sha=$(git -C "$tmp/mainpush-alpha-origin.git" rev-parse "$a_branch")
+b_main=$(git -C "$tmp/mainpush-beta-origin.git" rev-parse main)
+b_branch=$(agent_branch "$tmp/mainpush-beta")
+b_branch_sha=$(git -C "$tmp/mainpush-beta-origin.git" rev-parse "$b_branch")
+if [ "$a_main" = "$a_branch_sha" ] && [ "$b_main" = "$b_branch_sha" ]; then
+    ok "push_main fast-forwards tested branches onto origin/main"
+else
+    bad "push_main fast-forwards tested branches onto origin/main" \
+        "alpha $a_main/$a_branch_sha beta $b_main/$b_branch_sha"
 fi
 
 echo "daily task cap"

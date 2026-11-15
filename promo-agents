@@ -920,6 +920,11 @@ def finalize_repo(config: dict, group: dict, name: str, state_dir: Path,
                     detail = (pushed.stderr or pushed.stdout).strip()[-400:]
                     group["failures"][name] = f"push failed: {detail}"
 
+        if push_ok and repo.get("push_main") and tests_ok:
+            if not push_agent_branch_to_main(config, name, repo,
+                                            record["branch"], events):
+                group["failures"][name] = "main fast-forward/push failed"
+
         if push_ok:
             if not open_draft_pr(group, name, repo, worktree,
                                  record["branch"], test_status, events):
@@ -933,6 +938,53 @@ def finalize_repo(config: dict, group: dict, name: str, state_dir: Path,
     group["current"] = None
     if name not in group["done"]:
         group["done"].append(name)
+
+
+def push_agent_branch_to_main(config: dict, name: str, repo: dict,
+                              branch: str, events: Path) -> bool:
+    """Fast-forward the main checkout to a tested agent branch and push it.
+
+    This is opt-in via ``push_main = true``. The scheduler still uses a
+    worktree and a branch, so the main checkout stays untouched until tests
+    pass. If main has moved or the checkout is dirty, the branch is kept and
+    the task records a failure instead of force-updating main.
+    """
+    path = Path(repo.get("path", ""))
+    if not path.is_dir():
+        log(events, f"{name}: main checkout is missing at {path}")
+        return False
+    status = subprocess.run(
+        ["git", "-C", str(path), "status", "--porcelain"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if status:
+        log(events, f"{name}: main checkout is dirty; not merging {branch}")
+        return False
+    head = subprocess.run(
+        ["git", "-C", str(path), "symbolic-ref", "--short", "HEAD"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if head != "main":
+        log(events, f"{name}: main checkout is on {head!r}; not merging {branch}")
+        return False
+    merged = subprocess.run(
+        ["git", "-C", str(path), "merge", "--ff-only", branch],
+        capture_output=True, text=True,
+    )
+    if merged.returncode != 0:
+        detail = (merged.stderr or merged.stdout).strip()[-400:]
+        log(events, f"{name}: could not fast-forward main: {detail}")
+        return False
+    pushed = subprocess.run(
+        ["git", "-C", str(path), "push", "origin", "main"],
+        capture_output=True, text=True,
+    )
+    if pushed.returncode != 0:
+        detail = (pushed.stderr or pushed.stdout).strip()[-400:]
+        log(events, f"{name}: main fast-forwarded locally but push failed: {detail}")
+        return False
+    log(events, f"{name}: merged {branch} into main and pushed")
+    return True
 
 
 def move_task_done(task_path: str) -> None:
