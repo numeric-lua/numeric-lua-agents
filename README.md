@@ -94,9 +94,8 @@ schedulers. The lock file also contains the holder's PID for diagnostics; the
    ```
 
 2. Edit the windows, timezone, stop margin, lock path, and repository paths.
-   The example uses the final organization paths
-   `~/Códigos/numeric-lua/<repo>`. Until `luatorch` moves there, point its
-   `path` at `~/Códigos/luatorch`. A missing path is a refused launch, not a
+   The example uses the canonical organization paths
+   `~/Códigos/numeric-lua/<repo>`. A missing path is a refused launch, not a
    fallback.
 
 3. Check the resolved configuration without writing anything:

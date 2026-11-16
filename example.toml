@@ -65,8 +65,8 @@ path = "~/.local/state/numeric-lua/agents.lock"
 
 
 # Repository ids key the queue entries and the cross-repo `repos:` list.
-# After the organization transfer these are the canonical paths. Until
-# luatorch moves, point its `path` at ~/Códigos/luatorch; the scheduler fails
+# After the organization transfer these are the canonical paths. luatorch is
+# now a real checkout at ~/Códigos/numeric-lua/luatorch; the scheduler fails
 # closed on a missing checkout, and --dry-run only reports it.
 [repos.luatorch]
 path = "~/Códigos/numeric-lua/luatorch"
