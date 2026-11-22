@@ -395,9 +395,17 @@ def main():
                 sleep_until_open()
                 continue
             code = run_once(paths, config, state, args)
-            if code not in (0, None):
-                append_log(paths["log"], f"worker {code}; continuing")
-            time.sleep(2)
+            if code in (0, None):
+                state["consecutive_failures"] = 0
+                delay = 2
+            else:
+                failures = int(state.get("consecutive_failures", 0)) + 1
+                state["consecutive_failures"] = failures
+                delay = min(300, 5 * (2 ** min(failures - 1, 6)))
+                append_log(paths["log"],
+                           f"worker {code}; backoff {delay}s (failure {failures})")
+            save_state(paths["state"], state)
+            time.sleep(delay)
     finally:
         try:
             fcntl.flock(lock, fcntl.LOCK_UN)
