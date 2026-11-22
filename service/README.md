@@ -14,10 +14,10 @@ the active worker's process group, waits 20 seconds, then SIGKILLs it.
 ## Contribution limit
 
 Before each worker the scheduler asks GitHub for today's contribution square.
-If the square is `FOURTH_QUARTILE` ("dark green"), the daemon exits 0 and
-stops; the unit uses `Restart=on-failure` so it does not relaunch. Disable the
-guard with `"contribution_guard": false` in the config, or raise the floor with
-`contribution_min`.
+The default daily quota is **100 contributions**. When today's count reaches
+`contribution_min`, the daemon sleeps until 00:05 the next day and resumes. Set
+`"contribution_mode": "once"` to stop permanently instead. Disable the guard
+with `"contribution_guard": false`.
 
 ## Install
 

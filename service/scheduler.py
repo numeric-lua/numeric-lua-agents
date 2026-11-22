@@ -145,7 +145,8 @@ def load_config(paths):
         "stop_grace_seconds": STOP_GRACE,
         "max_worker_seconds": 4 * 60 * 60,
         "contribution_guard": True,
-        "contribution_min": 1,
+        "contribution_min": 100,
+        "contribution_mode": "daily",
     }
     try:
         raw = json.loads(paths["config"].read_text())
@@ -348,6 +349,14 @@ def run_once(paths, config, state, args):
     return code
 
 
+def _sleep_until_tomorrow():
+    now = now_local()
+    target = (now + timedelta(days=1)).replace(
+        hour=0, minute=5, second=0, microsecond=0)
+    while now_local() < target:
+        time.sleep(min(60, max(1, int((target - now_local()).total_seconds()))))
+
+
 def _terminate(proc, grace):
     if proc.poll() is not None:
         return
@@ -427,16 +436,25 @@ def main():
         return 0
     try:
         cleanup_orphan(paths, state, config.get("stop_grace_seconds", STOP_GRACE))
-        if contribution_reached(config):
-            append_log(paths["log"], "contribution target reached; stopping")
-            print("contribution target reached; stopping")
-            return 0
         if args.once:
+            if contribution_reached(config):
+                print("daily contribution target reached")
+                return 0
             if not args.ignore_window and not is_open(now_local()):
                 print(f"window closed; next open {next_open(now_local()).isoformat()}")
                 return 0
             return run_once(paths, config, state, args)
         while True:
+            if contribution_reached(config):
+                if config.get("contribution_mode", "daily") == "daily":
+                    append_log(paths["log"],
+                               "daily contribution target reached; sleeping until tomorrow")
+                    print("daily contribution target reached; sleeping until tomorrow")
+                    _sleep_until_tomorrow()
+                    continue
+                append_log(paths["log"], "contribution target reached; stopping")
+                print("contribution target reached; stopping")
+                return 0
             if not args.ignore_window and not is_open(now_local()):
                 sleep_until_open()
                 continue
