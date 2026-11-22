@@ -6,6 +6,7 @@ second slot (50%); each other project gets one slot per 14-run cycle.
     weekdays (Mon-Fri)  07:00-22:00 America/Sao_Paulo
     weekends (Sat-Sun)  continuous
 
+`max_worker_seconds` defaults to four hours and terminates a stuck worker.
 The daemon sleeps outside the window. At the weekday close it sends SIGTERM to
 the active worker's process group, waits 20 seconds, then SIGKILLs it.
 

@@ -143,6 +143,7 @@ def load_config(paths):
         "profile": "headless",
         "projects": {name: str(ROOT / name) for name in ["luar"] + PROJECTS},
         "stop_grace_seconds": STOP_GRACE,
+        "max_worker_seconds": 4 * 60 * 60,
     }
     try:
         raw = json.loads(paths["config"].read_text())
@@ -277,9 +278,15 @@ def run_once(paths, config, state, args):
         save_state(paths["state"], state)
         started = time.monotonic()
         try:
+            max_seconds = int(config.get("max_worker_seconds", 4 * 60 * 60))
             while proc.poll() is None:
                 if not args.ignore_window and not is_open(now_local()):
                     append_log(paths["log"], f"stop window closed for {project}")
+                    _terminate(proc, config["stop_grace_seconds"])
+                    break
+                if max_seconds > 0 and time.monotonic() - started > max_seconds:
+                    append_log(paths["log"],
+                               f"worker timeout after {max_seconds}s for {project}")
                     _terminate(proc, config["stop_grace_seconds"])
                     break
                 time.sleep(5)
