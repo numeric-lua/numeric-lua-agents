@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("scheduler", ROOT / "scheduler.py")
+scheduler = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(scheduler)
+
+
+class RotationTests(unittest.TestCase):
+    def test_rotation_is_fourteen_slots_and_half_luar(self):
+        self.assertEqual(len(scheduler.ROTATION), 14)
+        self.assertEqual(scheduler.ROTATION.count("luar"), 7)
+        self.assertEqual(set(scheduler.ROTATION), set(["luar"] + scheduler.PROJECTS))
+
+    def test_window_weekday_and_weekend(self):
+        tz = scheduler.TZ
+        self.assertTrue(scheduler.is_open(datetime(2026, 11, 23, 7, 0, tzinfo=tz)))
+        self.assertTrue(scheduler.is_open(datetime(2026, 11, 23, 21, 59, tzinfo=tz)))
+        self.assertFalse(scheduler.is_open(datetime(2026, 11, 23, 22, 0, tzinfo=tz)))
+        self.assertTrue(scheduler.is_open(datetime(2026, 11, 22, 23, 0, tzinfo=tz)))
+        self.assertFalse(scheduler.is_open(datetime(2026, 11, 23, 0, 0, tzinfo=tz)))
+
+    def test_friday_close_opens_saturday_midnight(self):
+        tz = scheduler.TZ
+        friday = datetime(2026, 11, 27, 22, 0, tzinfo=tz)
+        self.assertEqual(scheduler.next_open(friday).weekday(), 5)
+        self.assertEqual(scheduler.next_open(friday).hour, 0)
+
+
+class OnceTests(unittest.TestCase):
+    def test_once_invokes_one_fake_worker_and_records_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            repo = tmp / "luar"
+            (repo / ".git").mkdir(parents=True)
+            fake = tmp / "fake-dsh"
+            invocation = tmp / "invocation.txt"
+            fake.write_text(
+                "#!/bin/sh\ncat > " + str(invocation) + "\n"
+                "echo fake-dsh-ok\n")
+            fake.chmod(0o755)
+            config = tmp / "config.json"
+            config.write_text(json.dumps({
+                "dsh": str(fake),
+                "profile": "headless",
+                "projects": {"luar": str(repo)},
+            }))
+            env = os.environ.copy()
+            env["NUMERIC_LUA_SERVICE_STATE"] = str(tmp / "state")
+            env["NUMERIC_LUA_SERVICE_CONFIG"] = str(config)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scheduler.py"), "--once", "--ignore-window"],
+                env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("FIVE", invocation.read_text())
+            state = json.loads((tmp / "state" / "state.json").read_text())
+            self.assertEqual(state["runs"], 1)
+            self.assertEqual(state["counts"], {"luar": 1})
+            self.assertEqual(state["slot"], 1)
+            self.assertEqual(len(state["history"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,20 @@
+[Unit]
+Description=numeric-lua single-worker rotation service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/machine/Códigos/numeric-lua/numeric-lua-agents
+ExecStart=/usr/bin/python3 /home/machine/Códigos/numeric-lua/numeric-lua-agents/service/scheduler.py --daemon
+Environment=HOME=%h
+EnvironmentFile=%h/.config/numeric-lua/service.env
+Environment=DSH_HOME=%h/.dsh
+Environment=PATH=/home/machine/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=15
+KillMode=control-group
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target
