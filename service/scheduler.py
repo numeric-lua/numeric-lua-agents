@@ -246,7 +246,8 @@ def run_once(paths, config, state, args):
     project_dir = Path(config["projects"].get(project, ROOT / project))
     if not (project_dir / ".git").exists():
         raise SystemExit(f"project checkout missing: {project_dir}")
-    prompt = PROMPTS[project]
+    prompt = ("Commit directly to main; do not create a feature branch. "
+              "Keep the checkout clean when done.\n\n" + PROMPTS[project])
     stamp = now_local().strftime("%Y%m%d-%H%M%S")
     log_path = paths["child_log_dir"] / f"{stamp}-{project}.log"
     paths["child_log_dir"].mkdir(parents=True, exist_ok=True)
