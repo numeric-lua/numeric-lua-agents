@@ -207,6 +207,39 @@ def choose(state):
     return project, slot
 
 
+def _pid_is_dsh_worker(pid):
+    try:
+        cmdline = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+    except Exception:
+        return False
+    return b"dsh" in cmdline and b"headless" in cmdline
+
+
+def cleanup_orphan(paths, state, grace):
+    """Terminate a worker left behind by a previous scheduler instance."""
+    active = state.get("active")
+    if not isinstance(active, dict):
+        return
+    try:
+        pid = int(active.get("pid", 0))
+    except Exception:
+        pid = 0
+    if pid > 0 and pid != os.getpid() and _pid_is_dsh_worker(pid):
+        append_log(paths["log"], f"terminating orphan worker pid={pid}")
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            for _ in range(max(1, int(grace))):
+                time.sleep(1)
+                if not Path(f"/proc/{pid}").exists():
+                    break
+            if Path(f"/proc/{pid}").exists():
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    state.pop("active", None)
+    save_state(paths["state"], state)
+
+
 def run_once(paths, config, state, args):
     project, slot = choose(state)
     project_dir = Path(config["projects"].get(project, ROOT / project))
@@ -344,6 +377,7 @@ def main():
         print(f"another service is running (holder {holder or 'unknown'})")
         return 0
     try:
+        cleanup_orphan(paths, state, config.get("stop_grace_seconds", STOP_GRACE))
         if args.once:
             if not args.ignore_window and not is_open(now_local()):
                 print(f"window closed; next open {next_open(now_local()).isoformat()}")
