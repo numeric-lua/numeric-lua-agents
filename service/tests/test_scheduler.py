@@ -75,6 +75,7 @@ class OnceTests(unittest.TestCase):
                 "dsh": str(fake),
                 "profile": "headless",
                 "projects": {"luar": str(repo)},
+                "contribution_guard": False,
             }))
             env = os.environ.copy()
             env["NUMERIC_LUA_SERVICE_STATE"] = str(tmp / "state")

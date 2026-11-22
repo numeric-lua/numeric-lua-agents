@@ -144,6 +144,8 @@ def load_config(paths):
         "projects": {name: str(ROOT / name) for name in ["luar"] + PROJECTS},
         "stop_grace_seconds": STOP_GRACE,
         "max_worker_seconds": 4 * 60 * 60,
+        "contribution_guard": True,
+        "contribution_min": 1,
     }
     try:
         raw = json.loads(paths["config"].read_text())
@@ -239,6 +241,44 @@ def cleanup_orphan(paths, state, grace):
             pass
     state.pop("active", None)
     save_state(paths["state"], state)
+
+
+def contribution_status():
+    """Return (count, level) for today's GitHub contribution square."""
+    query = (
+        "query { viewer { contributionsCollection { contributionCalendar { "
+        "weeks { contributionDays { date contributionCount contributionLevel "
+        "} } } } } }"
+    )
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "graphql", "-f", "query=" + query],
+            capture_output=True, text=True, timeout=20)
+        if proc.returncode != 0:
+            return None
+        value = json.loads(proc.stdout)
+        days = value["data"]["viewer"]["contributionsCollection"][
+            "contributionCalendar"]["weeks"]
+        today = now_local().date().isoformat()
+        for week in days:
+            for day in week.get("contributionDays", []):
+                if day.get("date") == today:
+                    return (int(day.get("contributionCount", 0)),
+                            day.get("contributionLevel", ""))
+    except Exception:
+        return None
+    return None
+
+
+def contribution_reached(config):
+    if not config.get("contribution_guard", True):
+        return False
+    status = contribution_status()
+    if status is None:
+        return False
+    count, level = status
+    return (count >= int(config.get("contribution_min", 1))
+            and level == "FOURTH_QUARTILE")
 
 
 def run_once(paths, config, state, args):
@@ -364,7 +404,8 @@ def main():
                           "next": ROTATION[int(state.get("slot", 0)) % len(ROTATION)],
                           "runs": state.get("runs", 0),
                           "counts": state.get("counts", {}),
-                          "active": state.get("active")},
+                          "active": state.get("active"),
+                          "contribution": contribution_status()},
                          indent=2, sort_keys=True))
         return 0
     if args.reset_slot:
@@ -386,6 +427,10 @@ def main():
         return 0
     try:
         cleanup_orphan(paths, state, config.get("stop_grace_seconds", STOP_GRACE))
+        if contribution_reached(config):
+            append_log(paths["log"], "contribution target reached; stopping")
+            print("contribution target reached; stopping")
+            return 0
         if args.once:
             if not args.ignore_window and not is_open(now_local()):
                 print(f"window closed; next open {next_open(now_local()).isoformat()}")
