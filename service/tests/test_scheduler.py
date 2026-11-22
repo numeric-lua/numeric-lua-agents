@@ -29,11 +29,33 @@ class RotationTests(unittest.TestCase):
         self.assertTrue(scheduler.is_open(datetime(2026, 11, 22, 23, 0, tzinfo=tz)))
         self.assertFalse(scheduler.is_open(datetime(2026, 11, 23, 0, 0, tzinfo=tz)))
 
+    def test_monday_midnight_waits_for_seven(self):
+        tz = scheduler.TZ
+        monday = datetime(2026, 11, 23, 0, 0, tzinfo=tz)
+        nxt = scheduler.next_open(monday)
+        self.assertEqual(nxt.weekday(), 0)
+        self.assertEqual(nxt.hour, 7)
+
     def test_friday_close_opens_saturday_midnight(self):
         tz = scheduler.TZ
         friday = datetime(2026, 11, 27, 22, 0, tzinfo=tz)
         self.assertEqual(scheduler.next_open(friday).weekday(), 5)
         self.assertEqual(scheduler.next_open(friday).hour, 0)
+
+
+class CleanupTests(unittest.TestCase):
+    def test_cleanup_clears_non_dsh_active_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            state_path = tmp / "state.json"
+            log_path = tmp / "service.log"
+            state = {"active": {"pid": os.getpid(), "project": "x"}, "slot": 3}
+            state_path.write_text(json.dumps(state))
+            paths = {"state": state_path, "log": log_path}
+            scheduler.cleanup_orphan(paths, state, 1)
+            saved = json.loads(state_path.read_text())
+            self.assertNotIn("active", saved)
+            self.assertEqual(saved["slot"], 3)
 
 
 class OnceTests(unittest.TestCase):
