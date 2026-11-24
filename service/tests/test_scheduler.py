@@ -127,6 +127,13 @@ class ContributionGuardTests(unittest.TestCase):
             "contribution_guard": False,
         }))
 
+    def test_status_can_be_reused_without_another_query(self):
+        calls = []
+        scheduler.contribution_status = lambda: calls.append(True)
+        self.assertTrue(scheduler.contribution_reached(
+            {"contribution_min": 100}, (100, "SECOND_QUARTILE")))
+        self.assertEqual(calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

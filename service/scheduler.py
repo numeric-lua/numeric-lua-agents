@@ -286,10 +286,11 @@ def contribution_status():
     return None
 
 
-def contribution_reached(config):
+def contribution_reached(config, status=None):
     if not config.get("contribution_guard", True):
         return False
-    status = contribution_status()
+    if status is None:
+        status = contribution_status()
     if status is None:
         return False
     count, _level = status
@@ -433,6 +434,7 @@ def main():
     config = load_config(paths)
     state = load_state(paths["state"])
     if args.status:
+        contribution = contribution_status()
         print(json.dumps({"now": now_local().isoformat(),
                           "open": is_open(now_local()),
                           "slot": state.get("slot", 0),
@@ -440,7 +442,9 @@ def main():
                           "runs": state.get("runs", 0),
                           "counts": state.get("counts", {}),
                           "active": state.get("active"),
-                          "contribution": contribution_status(),
+                          "contribution": contribution,
+                          "contribution_reached": contribution_reached(
+                              config, contribution),
                           "agents": sorted(load_agents(paths["agents"]).keys())},
                          indent=2, sort_keys=True))
         return 0
