@@ -80,6 +80,9 @@ class OnceTests(unittest.TestCase):
             env = os.environ.copy()
             env["NUMERIC_LUA_SERVICE_STATE"] = str(tmp / "state")
             env["NUMERIC_LUA_SERVICE_CONFIG"] = str(config)
+            agents = tmp / "agents.json"
+            agents.write_text(json.dumps({"luar": "session-11111111-1111-1111-1111-111111111111"}))
+            env["NUMERIC_LUA_SERVICE_AGENTS"] = str(agents)
             result = subprocess.run(
                 [sys.executable, str(ROOT / "scheduler.py"), "--once", "--ignore-window"],
                 env=env, capture_output=True, text=True, timeout=30)

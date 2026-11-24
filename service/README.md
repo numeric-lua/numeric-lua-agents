@@ -19,6 +19,20 @@ The default daily quota is **100 contributions**. When today's count reaches
 `"contribution_mode": "once"` to stop permanently instead. Disable the guard
 with `"contribution_guard": false`.
 
+## Persistent project agents
+
+Run once (with `DEEPSEEK_API_KEY` available):
+
+```sh
+python3 service/bootstrap_agents.py
+```
+
+It creates exactly one headless session per project and stores the IDs in
+`~/.config/numeric-lua/service-agents.json`. The scheduler only resumes those
+sessions with `--session-id`; it never creates a fresh agent. Re-running the
+bootstrap is safe and skips existing bindings. To deliberately reset one
+project, remove its entry and re-run.
+
 ## Install
 
 ```sh

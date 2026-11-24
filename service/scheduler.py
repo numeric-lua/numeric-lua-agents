@@ -134,6 +134,9 @@ def default_paths():
         "config": Path(os.environ.get(
             "NUMERIC_LUA_SERVICE_CONFIG",
             home / ".config/numeric-lua/service.json")),
+        "agents": Path(os.environ.get(
+            "NUMERIC_LUA_SERVICE_AGENTS",
+            home / ".config/numeric-lua/service-agents.json")),
     }
 
 
@@ -157,6 +160,18 @@ def load_config(paths):
     except Exception as exc:  # malformed config must not silently run
         raise SystemExit(f"invalid config {paths['config']}: {exc}")
     return config
+
+
+def load_agents(path):
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        return data
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        raise SystemExit(f"invalid agents file {path}: {exc}")
 
 
 def load_state(path):
@@ -287,13 +302,22 @@ def run_once(paths, config, state, args):
     project_dir = Path(config["projects"].get(project, ROOT / project))
     if not (project_dir / ".git").exists():
         raise SystemExit(f"project checkout missing: {project_dir}")
-    prompt = ("Commit directly to main; do not create a feature branch. "
-              "Keep the checkout clean when done.\n\n" + PROMPTS[project])
+    agents = load_agents(paths["agents"])
+    session_id = agents.get(project)
+    if not isinstance(session_id, str) or not session_id.startswith("session-"):
+        raise SystemExit(
+            f"no persistent agent session for {project}; run "
+            "service/bootstrap_agents.py first")
+    prompt = ("Continue as the same persistent project agent, using the context "
+              "from your previous cycles. Commit directly to main; do not create "
+              "a feature branch. Keep the checkout clean when done.\n\n"
+              + PROMPTS[project])
     stamp = now_local().strftime("%Y%m%d-%H%M%S")
     log_path = paths["child_log_dir"] / f"{stamp}-{project}.log"
     paths["child_log_dir"].mkdir(parents=True, exist_ok=True)
     dsh = config.get("dsh", "dsh")
-    argv = [dsh, "--profile", config.get("profile", "headless"), "-"]
+    argv = [dsh, "--profile", config.get("profile", "headless"),
+            "--session-id", session_id, "-"]
     env = os.environ.copy()
     env.setdefault("DSH_HOME", str(Path.home() / ".dsh"))
     append_log(paths["log"], f"start {project} slot={slot} dir={project_dir}")
@@ -414,7 +438,8 @@ def main():
                           "runs": state.get("runs", 0),
                           "counts": state.get("counts", {}),
                           "active": state.get("active"),
-                          "contribution": contribution_status()},
+                          "contribution": contribution_status(),
+                          "agents": sorted(load_agents(paths["agents"]).keys())},
                          indent=2, sort_keys=True))
         return 0
     if args.reset_slot:

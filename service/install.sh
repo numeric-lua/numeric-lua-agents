@@ -22,6 +22,10 @@ JSON
 fi
 install -m 644 "$ROOT/service/numeric-lua-service.service" \
   "$USER_UNIT_DIR/numeric-lua-service.service"
+if [ ! -f "$CONFIG_DIR/service-agents.json" ]; then
+  echo "No persistent agents configured yet; run:" >&2
+  echo "  python3 $ROOT/service/bootstrap_agents.py" >&2
+fi
 systemctl --user daemon-reload
 systemctl --user enable --now numeric-lua-service.service
 systemctl --user --no-pager status numeric-lua-service.service | head -20
