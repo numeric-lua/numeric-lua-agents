@@ -98,6 +98,15 @@ class OnceTests(unittest.TestCase):
             self.assertEqual(len(state["history"]), 1)
 
 
+class PromptTests(unittest.TestCase):
+    def test_every_project_prompt_forbids_releases_and_requires_tests(self):
+        for project in scheduler.PROMPTS:
+            prompt = scheduler.build_prompt(project)
+            self.assertIn("Do not create tags or GitHub releases", prompt)
+            self.assertNotIn("cut a release", prompt)
+            self.assertIn("push only after the repository's tests pass", prompt)
+
+
 class ContributionGuardTests(unittest.TestCase):
     """The quota is an absolute count, independent of GitHub's relative level."""
 

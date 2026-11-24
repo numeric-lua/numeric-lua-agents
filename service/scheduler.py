@@ -299,6 +299,13 @@ def contribution_reached(config, status=None):
     return count >= int(config.get("contribution_min", 1))
 
 
+def build_prompt(project):
+    return ("Continue as the same persistent project agent, using the context "
+            "from your previous cycles. Commit directly to main; do not create "
+            "a feature branch. Keep the checkout clean when done.\n\n"
+            + PROMPTS[project] + WORK_RULES)
+
+
 def run_once(paths, config, state, args):
     project, slot = choose(state)
     project_dir = Path(config["projects"].get(project, ROOT / project))
@@ -310,10 +317,7 @@ def run_once(paths, config, state, args):
         raise SystemExit(
             f"no persistent agent session for {project}; run "
             "service/bootstrap_agents.py first")
-    prompt = ("Continue as the same persistent project agent, using the context "
-              "from your previous cycles. Commit directly to main; do not create "
-              "a feature branch. Keep the checkout clean when done.\n\n"
-              + PROMPTS[project] + WORK_RULES)
+    prompt = build_prompt(project)
     stamp = now_local().strftime("%Y%m%d-%H%M%S")
     log_path = paths["child_log_dir"] / f"{stamp}-{project}.log"
     paths["child_log_dir"].mkdir(parents=True, exist_ok=True)
@@ -455,7 +459,7 @@ def main():
     if args.dry_run:
         project, _ = choose(state)
         print(f"dry-run: next={project}")
-        print(PROMPTS[project])
+        print(build_prompt(project))
         return 0
     if not (args.once or args.daemon):
         parser.error("choose --daemon, --once, --dry-run, --status, --plan, or --reset-slot")
