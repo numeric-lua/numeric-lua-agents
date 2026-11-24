@@ -95,5 +95,38 @@ class OnceTests(unittest.TestCase):
             self.assertEqual(len(state["history"]), 1)
 
 
+class ContributionGuardTests(unittest.TestCase):
+    """The quota is an absolute count, independent of GitHub's relative level."""
+
+    def setUp(self):
+        self._original = scheduler.contribution_status
+
+    def tearDown(self):
+        scheduler.contribution_status = self._original
+
+    def test_count_at_quota_stops_even_at_lower_level(self):
+        scheduler.contribution_status = lambda: (100, "SECOND_QUARTILE")
+        self.assertTrue(scheduler.contribution_reached({"contribution_min": 100}))
+
+    def test_count_above_quota_stops_at_any_level(self):
+        scheduler.contribution_status = lambda: (150, "FIRST_QUARTILE")
+        self.assertTrue(scheduler.contribution_reached({"contribution_min": 100}))
+
+    def test_count_below_quota_keeps_work_even_at_top_level(self):
+        scheduler.contribution_status = lambda: (99, "FOURTH_QUARTILE")
+        self.assertFalse(scheduler.contribution_reached({"contribution_min": 100}))
+
+    def test_unavailable_status_does_not_stop_work(self):
+        scheduler.contribution_status = lambda: None
+        self.assertFalse(scheduler.contribution_reached({"contribution_min": 100}))
+
+    def test_guard_can_be_disabled(self):
+        scheduler.contribution_status = lambda: (1000, "FOURTH_QUARTILE")
+        self.assertFalse(scheduler.contribution_reached({
+            "contribution_min": 100,
+            "contribution_guard": False,
+        }))
+
+
 if __name__ == "__main__":
     unittest.main()

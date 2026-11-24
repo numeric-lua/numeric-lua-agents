@@ -292,9 +292,11 @@ def contribution_reached(config):
     status = contribution_status()
     if status is None:
         return False
-    count, level = status
-    return (count >= int(config.get("contribution_min", 1))
-            and level == "FOURTH_QUARTILE")
+    count, _level = status
+    # The quota is an absolute count.  contributionLevel is a quartile relative
+    # to this account's own contribution history, so it can remain
+    # SECOND_QUARTILE well past the quota; gating on it lets the daemon run on.
+    return count >= int(config.get("contribution_min", 1))
 
 
 def run_once(paths, config, state, args):
