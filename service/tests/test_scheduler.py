@@ -58,6 +58,26 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(saved["slot"], 3)
 
 
+class QuotaResetTests(unittest.TestCase):
+    def test_just_after_midnight_resets_today(self):
+        tz = scheduler.TZ
+        now = datetime(2026, 11, 25, 0, 3, tzinfo=tz)
+        self.assertEqual(scheduler.next_quota_reset(now),
+                         datetime(2026, 11, 25, 0, 5, tzinfo=tz))
+
+    def test_after_the_boundary_resets_tomorrow(self):
+        tz = scheduler.TZ
+        now = datetime(2026, 11, 25, 0, 6, tzinfo=tz)
+        self.assertEqual(scheduler.next_quota_reset(now),
+                         datetime(2026, 11, 26, 0, 5, tzinfo=tz))
+
+    def test_at_the_boundary_resets_tomorrow(self):
+        tz = scheduler.TZ
+        now = datetime(2026, 11, 25, 0, 5, tzinfo=tz)
+        self.assertEqual(scheduler.next_quota_reset(now),
+                         datetime(2026, 11, 26, 0, 5, tzinfo=tz))
+
+
 class OnceTests(unittest.TestCase):
     def test_once_invokes_one_fake_worker_and_records_state(self):
         with tempfile.TemporaryDirectory() as tmp:

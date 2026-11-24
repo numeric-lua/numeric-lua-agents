@@ -379,10 +379,16 @@ def run_once(paths, config, state, args):
     return code
 
 
+def next_quota_reset(now):
+    """The next 00:05 boundary, today if it is still ahead, else tomorrow."""
+    target = now.replace(hour=0, minute=5, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
 def _sleep_until_tomorrow():
-    now = now_local()
-    target = (now + timedelta(days=1)).replace(
-        hour=0, minute=5, second=0, microsecond=0)
+    target = next_quota_reset(now_local())
     while now_local() < target:
         time.sleep(min(60, max(1, int((target - now_local()).total_seconds()))))
 
