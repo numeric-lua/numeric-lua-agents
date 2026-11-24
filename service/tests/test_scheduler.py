@@ -87,7 +87,10 @@ class OnceTests(unittest.TestCase):
                 [sys.executable, str(ROOT / "scheduler.py"), "--once", "--ignore-window"],
                 env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("FIVE", invocation.read_text())
+            prompt = invocation.read_text()
+            self.assertIn("FIVE", prompt)
+            self.assertIn("Do not create tags or GitHub releases", prompt)
+            self.assertNotIn("cut a release", prompt)
             state = json.loads((tmp / "state" / "state.json").read_text())
             self.assertEqual(state["runs"], 1)
             self.assertEqual(state["counts"], {"luar": 1})

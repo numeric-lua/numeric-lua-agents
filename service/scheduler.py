@@ -47,51 +47,50 @@ ROTATION = []
 for project in PROJECTS:
     ROTATION.extend(["luar", project])
 
+WORK_RULES = """
+Coordination rules: commit directly to main, and push only after the repository's tests pass.
+Do not create tags or GitHub releases, do not bump versions or rockspecs, and do not publish
+packages; the coordinator owns releases. Put user-visible changes under `## Unreleased` in
+CHANGELOG.md. Report the tasks, commits, exact tests run, and risks."""
+
+
 PROMPTS = {
     "luar": """You are the sole active project worker. Work only in /home/machine/Códigos/numeric-lua/luar.
 Read AGENTS.md, doc/architecture.md, doc/roadmap.md, CHANGELOG and tests.
 Define exactly FIVE concrete high-value tasks (JIT/FFI/runtime correctness or performance),
 implement and test all five. You may use at most ONE DeepSeek Pro subagent at a time for heavy
 JIT analysis or patch generation, but it must be read-only or use a separate worktree/patch:
-you own all edits, tests, commits, pushes, tags and releases. Never run two subagents at once.
+you own all edits, tests, commits and pushes. Never run two subagents at once.
 Follow the repo rules: edit src/ not vendor/, mark core edits /* LUAR */, no new runtime deps.
-Run at minimum `make test`; add `make WITH_FFI=1 test`, `make JIT=0 test`, and ASAN when warranted.
-You may push and cut a new release/tag when you judge appropriate. Report five tasks, commits,
-exact tests, any tag/release, and risks.""",
+Run at minimum `make test`; add `make WITH_FFI=1 test`, `make JIT=0 test`, and ASAN when warranted.""",
     "luatorch": """You are the sole active project worker. Work only in /home/machine/Códigos/numeric-lua/luatorch.
 Define exactly FIVE concrete tasks and implement all five, with tests and docs; prefer a safe
-real-valued linalg/API gap. Keep C++ changes minimal. Run ./scripts/test.sh. You may push and cut
-a release/tag when you judge appropriate. Do not spawn subagents. Report tasks, commits, tests, release.""",
+real-valued linalg/API gap. Keep C++ changes minimal. Run ./scripts/test.sh. Do not spawn subagents.""",
     "numlua": """You are the sole active project worker. Work only in /home/machine/Códigos/numeric-lua/numlua.
 Define exactly FIVE concrete NumPy-parity/IO tasks and implement all five with tests/docs. No new
-runtime deps. Run ./scripts/test.sh and NUMLUA_DISABLE_ZLIB=1 ./scripts/test.sh. You may push and cut
-a release/tag when appropriate. Do not spawn subagents. Report tasks, commits, tests, release.""",
+runtime deps. Run ./scripts/test.sh and NUMLUA_DISABLE_ZLIB=1 ./scripts/test.sh. Do not spawn subagents.""",
     "luaplotlib": """You are the sole active project worker. Work only in /home/machine/Códigos/numeric-lua/luaplotlib.
 Define exactly FIVE concrete renderer/API tasks and implement all five with tests/docs/visual QA.
-Preserve cartesian behavior. Run ./scripts/test.sh, make examples, scripts/visual-qa.sh. You may push
-and cut a release/tag when appropriate. Do not spawn subagents. Report tasks, commits, tests, release.""",
+Preserve cartesian behavior. Run ./scripts/test.sh, make examples, scripts/visual-qa.sh.
+Do not spawn subagents.""",
     "lua-polars": """You are the sole active project worker. Work only in /home/machine/Códigos/numeric-lua/lua-polars.
 Define exactly FIVE concrete DataFrame/IO tasks and implement all five with tests/docs. Use
 CARGO_BUILD_JOBS=1 and scripts/ensure-bridge.sh; avoid cold rebuilds. Run ./scripts/test.sh,
-./scripts/smoke.sh, ./scripts/rockspec.sh. You may push and cut a release/tag when appropriate.
-Do not spawn subagents. Report tasks, commits, tests, release.""",
+./scripts/smoke.sh, ./scripts/rockspec.sh. Do not spawn subagents.""",
     "lua-notebooks": """You are the sole active project worker. Work only in /home/machine/Códigos/numeric-lua/lua-notebooks.
 Define exactly FIVE concrete user-facing tasks and implement all five with tests/docs/QA. Preserve
 Neovim and visual baselines. Run make test, make test-nvim, make test-webapp, visual baseline and
-relevant QA. You may push and cut a release/tag when appropriate. Do not spawn subagents.
-Report tasks, commits, tests, release.""",
+relevant QA. Do not spawn subagents.""",
     "tensorflow-lua": """You are the sole active project worker. Work only in /home/machine/Códigos/numeric-lua/tensorflow-lua.
 Read AGENTS.md/docs first. Define exactly FIVE concrete graph/eager/training/ops tasks with tests that
 run without Python; check TF_Status and use ffi.gc. Reuse third_party/libtensorflow, never vendor it.
-Run `make test`. You may push and cut a release/tag when appropriate. Do not spawn subagents.
-Report tasks, commits, tests, release.""",
+Run `make test`. Do not spawn subagents.""",
     "tensorflow-lua-addons": """You are the sole active project worker. Work only in
 /home/machine/Códigos/numeric-lua/tensorflow-lua-addons. Read AGENTS.md and the parity table. Define
 exactly FIVE concrete TensorFlow Addons parity tasks and implement all five using only the public
 tensorflow API, with graph-mode session tests. Reuse ../tensorflow-lua/third_party/libtensorflow;
 never add Python/Node/PyTorch runtime deps. Run
-TENSORFLOW_ROOT="../tensorflow-lua/third_party/libtensorflow" ./scripts/test.sh. You may push and cut
-a release/tag when appropriate. Do not spawn subagents. Report tasks, commits, tests, release.""",
+TENSORFLOW_ROOT="../tensorflow-lua/third_party/libtensorflow" ./scripts/test.sh. Do not spawn subagents.""",
 }
 
 
@@ -314,7 +313,7 @@ def run_once(paths, config, state, args):
     prompt = ("Continue as the same persistent project agent, using the context "
               "from your previous cycles. Commit directly to main; do not create "
               "a feature branch. Keep the checkout clean when done.\n\n"
-              + PROMPTS[project])
+              + PROMPTS[project] + WORK_RULES)
     stamp = now_local().strftime("%Y%m%d-%H%M%S")
     log_path = paths["child_log_dir"] / f"{stamp}-{project}.log"
     paths["child_log_dir"].mkdir(parents=True, exist_ok=True)

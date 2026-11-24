@@ -19,6 +19,16 @@ The default daily quota is **100 contributions**. When today's count reaches
 `"contribution_mode": "once"` to stop permanently instead. Disable the guard
 with `"contribution_guard": false`.
 
+The quota is the **absolute count**. GitHub's `contributionLevel` is a quartile
+relative to the account's own history, so a busy account can still read
+`SECOND_QUARTILE` after passing the quota; the guard does not use it. Because
+the check runs between workers, one worker can overshoot by the commits it
+pushes before the next check. `--status` reports `contribution_reached`.
+
+Workers commit and push tested changes to `main`, but do not create tags or
+releases, bump versions, or edit rockspecs. Releases are coordinator-only; the
+shared `WORK_RULES` suffix in `scheduler.py` states this in every prompt.
+
 ## Persistent project agents
 
 Run once (with `DEEPSEEK_API_KEY` available):
@@ -53,6 +63,9 @@ journalctl --user -u numeric-lua-service -f
 python3 service/scheduler.py --status
 python3 service/scheduler.py --plan
 ```
+
+`--status` shows today's contribution count, whether the quota has been
+reached, the next project, and the active worker (if any).
 
 State and per-worker logs live under
 `~/.local/state/numeric-lua/service/`. The service lock prevents two schedulers

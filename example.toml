@@ -89,9 +89,9 @@ tests = ["./scripts/test.sh"]
 push = false
 open_pr = false
 
-[repos.tensorlua]
-path = "~/Códigos/numeric-lua/tensorlua"
-queue = "~/.config/numeric-lua/agents/queue/tensorlua"
+[repos.tensorflow-lua]
+path = "~/Códigos/numeric-lua/tensorflow-lua"
+queue = "~/.config/numeric-lua/agents/queue/tensorflow-lua"
 tests = ["./scripts/test.sh"]
 push = false
 open_pr = false

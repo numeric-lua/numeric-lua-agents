@@ -1,15 +1,52 @@
 # numeric-lua agents
 
 Organization tooling for the `numeric-lua` project. This repository is **not**
-shipped with any library; it schedules headless DSH agents during provider
-discount ("promo") hours so the coordinator can review small, focused changes.
+shipped with any library; it runs headless DSH project workers and a queue
+scheduler so the coordinator can review small, focused changes.
 
-The scheduler is adapted from the Maria Padilha scheduler. It preserves the
-same safety model — one agent at a time, worktrees and branches, a stop margin,
-state under the user's config/state directories, and a dry run that writes
-nothing — and adds optional pushed branches, draft PRs, or tested fast-forwards
-to `main`. Pushes are disabled by default; direct-main mode requires both
-`push = true` and `push_main = true`.
+Two runners live here:
+
+- **`service/scheduler.py`** — the installed permanent project service. It
+  resumes one persistent DSH session per project and rotates them on a fixed
+  schedule; see [Permanent project service](#permanent-project-service).
+- **`promo-agents`** — the queue scheduler, adapted from the Maria Padilha
+  scheduler. It works coordinator-written task briefs in throwaway worktrees
+  during configured discount windows.
+
+## Permanent project service
+
+The service is installed as the `numeric-lua-service.service` user unit. It is
+intentionally different from the queue scheduler:
+
+- one worker at a time, resuming one fixed headless DSH session per project
+  (`service-agents.json`); it never creates a fresh agent;
+- a 14-slot rotation per cycle: `luar` gets every second slot (50%) and each of
+  the other seven projects gets one;
+- weekdays 07:00–22:00 America/Sao_Paulo, continuous at weekends, with a
+  four-hour worker timeout;
+- after every worker it reads the account's GitHub contribution count and, at
+  `contribution_min` (default 100), sleeps until 00:05 the next day. The quota
+  is the absolute count; `contributionLevel` is shown by `--status` but is not
+  used, because it is relative to the account's own history;
+- workers run in the project's main checkout, commit to `main`, and push after
+  the repository's tests pass;
+- workers do not tag, cut releases, bump versions, or edit rockspecs. Those are
+  coordinator actions; see `WORK_RULES` in the scheduler.
+
+The service lock is `~/.local/state/numeric-lua/service/service.lock`; state and
+per-worker logs live beside it. `--status` reports the count, whether the quota
+has been reached, and the active worker. Operations are documented in
+[`service/README.md`](service/README.md).
+
+> The systemd unit is coordinator-managed. Do not install, stop, restart, or
+> reconfigure it without an explicit request.
+
+The queue scheduler is adapted from the Maria Padilha scheduler. It preserves
+the same safety model — one agent at a time, worktrees and branches, a stop
+margin, state under the user's config/state directories, and a dry run that
+writes nothing — and adds optional pushed branches, draft PRs, or tested
+fast-forwards to `main`. Pushes are disabled by default; direct-main mode
+requires both `push = true` and `push_main = true`.
 
 1. tasks that may name several repositories;
 2. a configurable host-wide `fcntl.flock` held for the whole tick.
@@ -22,9 +59,9 @@ leaves the branch for review. With `push_main = true` it first requires the
 tests to pass, fast-forwards the main checkout, and pushes `origin/main`; a
 dirty or diverged main is reported instead of forced.
 
-The scheduler does not invent work. The coordinator (the human plus the main
-DSH session) owns the queues. An empty queue idles unless maintenance rounds
-are explicitly enabled.
+The queue scheduler does not invent work. The coordinator (the human plus the
+main DSH session) owns the queues. An empty queue idles unless maintenance
+rounds are explicitly enabled.
 
 > **Promo-hour warning.** The discount windows are configuration, not a
 > hardcoded promise. Provider peak/off-peak hours and prices change. Verify the
@@ -33,7 +70,7 @@ are explicitly enabled.
 > <https://api-docs.deepseek.com/quick_start/pricing>. The example windows are
 > copied from the Maria scheduler and are placeholders.
 
-## Safety model
+## Queue safety model
 
 - **One agent at a time.** A cross-repository task runs one repository's agent
   after another, never in parallel. All worktrees are created before the first
@@ -82,7 +119,8 @@ schedulers. The lock file also contains the holder's PID for diagnostics; the
 - Python 3.11 or newer (`tomllib`)
 - `git`
 - a `dsh` executable on `PATH` (or configured as an absolute path)
-- optional: `gh` for `open_pr = true`; without it the scheduler logs a skip
+- `gh` for `open_pr = true` and for the permanent service contribution quota;
+  without it the service cannot see the count and keeps working
 
 ## Setup
 
@@ -284,7 +322,7 @@ It covers configuration errors, dry-run/no-write, enqueue, one-repo ticks,
 cross-repo worktrees/branches/commits, dirty-checkout refusal, stop margin,
 host lock, no push/PR when disabled, and linked draft PRs when enabled.
 
-## Timer
+## Queue timer
 
 The systemd **user** bus is not available in the current LightDM session, so
 the units are system units that run as the checkout owner. They live in
@@ -300,7 +338,8 @@ install -m 600 example.toml ~/.config/numeric-lua/agents.toml
 sudo ./systemd/install.sh
 ```
 
-Do **not** install or enable the timer during bring-up. Validate with the fake
+This timer is for the queue scheduler, not the installed permanent service.
+Do **not** install or enable it during bring-up. Validate with the fake
 `dsh` suite, then `--dry-run`, then one manual `--once` against a real
 repository, and only enable the timer after the coordinator has reviewed
 several branches. The installer intentionally uses `enable --now` like Maria's;
@@ -329,3 +368,7 @@ finalization tests to finish.
   Maria tick that uses a different lock file.
 - The coordinator owns merges, releases, package publishes, and organization
   settings. The scheduler never performs them.
+- The permanent service stops for the day at `contribution_min`. Do not restart
+  or reconfigure it to get more work out of an exhausted day.
+- Workers do not tag, release, bump versions, or edit rockspecs; they add
+  `## Unreleased` entries and push tested commits to `main`.
